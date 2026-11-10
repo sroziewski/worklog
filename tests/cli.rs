@@ -159,6 +159,89 @@ mod parse_errors {
     }
 }
 
+mod first_log_line {
+    use super::*;
+
+    /// `HH:MM:SS.mmm` the console line starts with, then the rest of the line.
+    fn console_parts(line: &str) -> (&str, &str) {
+        let (time, rest) = line.split_at(line.char_indices().nth(12).map_or(line.len(), |(i, _)| i));
+        assert!(chrono::NaiveTime::parse_from_str(time, "%H:%M:%S%.3f").is_ok() && time.len() == 12, "console time in {line:?}");
+        (time, rest)
+    }
+
+    /// The file line's message after `YYYY-MM-DD HH:MM:SS.mmm <LEVEL padded to 5> [<pid>] `, and
+    /// its level part.
+    fn file_parts(line: &str) -> (String, String) {
+        let (stamp, rest) = line.split_at(line.char_indices().nth(23).map_or(line.len(), |(i, _)| i));
+        assert!(chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S%.3f").is_ok(), "file stamp in {line:?}");
+        let (level, after) = rest.split_once('[').unwrap_or_else(|| panic!("no [pid] in {line:?}"));
+        let (pid, message) = after.split_once("] ").unwrap_or_else(|| panic!("no [pid] in {line:?}"));
+        assert!(!pid.is_empty() && pid.chars().all(|c| c.is_ascii_digit()), "pid in {line:?}");
+        (level.to_owned(), message.to_owned())
+    }
+
+    #[test]
+    fn console_and_file_start_with_the_log_file_at_the_cli_s_level() {
+        // (flags, the console's first line names the file). -q shows warnings only; the file
+        // always gets everything.
+        let rows: [(&[&str], bool); 3] = [(&[], true), (&["-v"], true), (&["-q"], false)];
+        for (flags, on_console) in rows {
+            let sb = Sandbox::new();
+            let jira = dead_jira();
+            let args: Vec<&str> = flags.iter().copied().chain(["--config", sb.config.as_str(), "config"]).collect();
+            let (code, _, stderr) = sb.run(&args, &jira.base);
+            assert_eq!(code, Some(0), "{flags:?}: {stderr}");
+            let expected = format!(" INFO  log file: {}", sb.log.display());
+            if on_console {
+                let first = stderr.lines().next().unwrap_or_else(|| panic!("{flags:?}: no console output"));
+                assert_eq!(console_parts(first).1, expected, "{flags:?}: {stderr}");
+            } else {
+                assert!(stderr.lines().all(|l| !l.contains("log file:")), "{flags:?}: {stderr}");
+            }
+            let log = std::fs::read_to_string(&sb.log).unwrap_or_else(|e| panic!("{}: {e}", sb.log.display()));
+            let first = log.lines().next().unwrap_or_else(|| panic!("{flags:?}: empty log"));
+            assert_eq!(file_parts(first), (" INFO  ".to_string(), format!("log file: {}", sb.log.display())), "{flags:?}: {log}");
+            assert_eq!(jira.requests().len(), 0, "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn a_run_appends_its_log_file_line_after_earlier_runs() {
+        let sb = Sandbox::new();
+        std::fs::create_dir_all(sb.log.parent().unwrap()).unwrap();
+        std::fs::write(&sb.log, "2026-11-09 08:00:00.000 INFO  [7] an earlier run\n").unwrap();
+        let jira = dead_jira();
+        let (code, _, stderr) = sb.run(&["--config", &sb.config, "config"], &jira.base);
+        assert_eq!(code, Some(0), "{stderr}");
+        let log = std::fs::read_to_string(&sb.log).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines[0], "2026-11-09 08:00:00.000 INFO  [7] an earlier run", "{log}");
+        assert_eq!(file_parts(lines[1]), (" INFO  ".to_string(), format!("log file: {}", sb.log.display())), "{log}");
+    }
+
+    #[test]
+    fn an_unopenable_log_file_is_named_first_as_a_warning_even_when_quiet() {
+        for flags in [&[][..], &["-q"][..]] {
+            let mut sb = Sandbox::new();
+            // A directory where the file should be: it exists, but cannot be opened as a file.
+            sb.log = sb.local_env.parent().unwrap().join("logdir");
+            std::fs::create_dir_all(&sb.log).unwrap();
+            let jira = dead_jira();
+            let args: Vec<&str> = flags.iter().copied().chain(["--config", sb.config.as_str(), "config"]).collect();
+            let (code, stdout, stderr) = sb.run(&args, &jira.base);
+            assert_eq!(code, Some(0), "{flags:?}: {stderr}");
+            assert_eq!(stdout.lines().next(), Some(format!("# {}", sb.config).as_str()), "{flags:?}: the run goes on: {stdout}");
+            let first = stderr.lines().next().unwrap_or_else(|| panic!("{flags:?}: no console output"));
+            assert_eq!(
+                console_parts(first).1,
+                format!(" WARN  log file: {} cannot be opened; logging to the console only", sb.log.display()),
+                "{flags:?}: {stderr}"
+            );
+            assert!(sb.log.is_dir(), "{flags:?}");
+        }
+    }
+}
+
 mod runs {
     use super::*;
 

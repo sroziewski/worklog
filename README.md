@@ -166,9 +166,11 @@ worklog -v suggest                  # also show every git command and Jira reque
 worklog -q suggest                  # no progress lines, only warnings and the result
 ```
 
-Progress goes to the console (stderr) while it works — Jira user, each repo scanned with its
-event count and time, what was already logged, each suggestion. A run takes a few seconds,
-mostly git.
+The first line of every run names the log file. Progress goes to the console (stderr) while it
+works — Jira user, each repo scanned with its event count and time, what was already logged,
+each suggestion. Repos are read 5 at a time; the window's loading line shows the step, and while
+reading git how many repos are done and which ones are being read. A run takes a few seconds
+to a minute, mostly git.
 
 Test it with `suggest` first; it is read-only.
 

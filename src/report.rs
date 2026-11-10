@@ -44,11 +44,91 @@ pub fn build(cfg: &Config, jira: &Jira, date: NaiveDate) -> Result<Report> {
     build_at(cfg, jira, date, Local::now().date_naive(), git::global_user_email())
 }
 
+/// A step of `build_at_with`, for showing what it is doing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Progress {
+    /// A step other than reading git, e.g. "asking Jira who you are".
+    Step(String),
+    /// Reading git starts over this many repos.
+    Scanning(usize),
+    Scan(git::ScanEvent),
+}
+
+/// What the window shows while the report is built: the step, and while reading git, how many
+/// repos are done and which are being read.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LoadProgress {
+    pub step: String,
+    /// Reading git: `label` shows the repo count and the repos being read.
+    pub scanning: bool,
+    pub total: usize,
+    pub done: usize,
+    /// Names of the repos being read now, in the order they started.
+    pub active: Vec<String>,
+}
+
+fn repo_name(p: &std::path::Path) -> String {
+    p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+impl LoadProgress {
+    pub fn apply(&mut self, p: Progress) {
+        match p {
+            Progress::Step(s) => {
+                self.step = s;
+                self.scanning = false;
+                self.active.clear();
+            }
+            Progress::Scanning(n) => {
+                self.step = "reading git".into();
+                self.scanning = true;
+                self.total = n;
+                self.done = 0;
+                self.active.clear();
+            }
+            Progress::Scan(git::ScanEvent::Started(repo)) => self.active.push(repo_name(&repo)),
+            Progress::Scan(git::ScanEvent::Finished { repo, .. }) => {
+                let name = repo_name(&repo);
+                if let Some(i) = self.active.iter().position(|a| *a == name) {
+                    self.active.remove(i);
+                }
+                self.done += 1;
+            }
+        }
+    }
+
+    /// One line: "reading git: 12/23 repos · now: a, b" while scanning, else the step.
+    pub fn label(&self) -> String {
+        if self.scanning {
+            let now = if self.active.is_empty() { String::new() } else { format!(" · now: {}", self.active.join(", ")) };
+            format!("reading git: {}/{} repos{now}", self.done, self.total)
+        } else if self.step.is_empty() {
+            "starting…".to_owned()
+        } else {
+            format!("{}…", self.step)
+        }
+    }
+}
+
 /// `build` with the clock and the git-config fallback email passed in: uncommitted files count
 /// only when `date == today`, and `fallback_email` stands in when `author_emails` is empty.
 pub fn build_at(cfg: &Config, jira: &Jira, date: NaiveDate, today: NaiveDate, fallback_email: Option<String>) -> Result<Report> {
+    build_at_with(cfg, jira, date, today, fallback_email, &|_| {})
+}
+
+/// `build_at`, telling `progress` each step as it starts: the Jira user, reading git (each repo
+/// as it starts and finishes), the time already logged, the ticket lookups, the open tickets.
+pub fn build_at_with(
+    cfg: &Config,
+    jira: &Jira,
+    date: NaiveDate,
+    today: NaiveDate,
+    fallback_email: Option<String>,
+    progress: &(dyn Fn(Progress) + Sync),
+) -> Result<Report> {
     let started = std::time::Instant::now();
     log::info!("building suggestions for {date}");
+    progress(Progress::Step("asking Jira who you are".into()));
     let me = jira.myself()?;
     log::info!("Jira user {me} ({:.2}s)", started.elapsed().as_secs_f64());
     let mut emails = cfg.author_emails.clone();
@@ -76,7 +156,8 @@ pub fn build_at(cfg: &Config, jira: &Jira, date: NaiveDate, today: NaiveDate, fa
     }
     log::info!("scanning {} repos under {:?} (uncommitted files: {})", repos.len(), cfg.repo_roots, date == today);
     let t = std::time::Instant::now();
-    let (events, errors) = collector.collect(&repos);
+    progress(Progress::Scanning(repos.len()));
+    let (events, errors) = collector.collect_with(&repos, &|e| progress(Progress::Scan(e)));
     log::info!("git: {} events in {:.2}s", events.len(), t.elapsed().as_secs_f64());
     for e in &errors {
         log::warn!("{e}");
@@ -84,6 +165,7 @@ pub fn build_at(cfg: &Config, jira: &Jira, date: NaiveDate, today: NaiveDate, fa
     warnings.extend(errors);
 
     let t = std::time::Instant::now();
+    progress(Progress::Step(format!("reading what you logged on {date}")));
     let logged = jira.logged_on(&me, date)?;
     let already: u32 = logged.iter().map(|(_, m)| m).sum();
     log::info!("already logged on {date}: {already} min on {} issues ({:.2}s)", logged.len(), t.elapsed().as_secs_f64());
@@ -102,6 +184,8 @@ pub fn build_at(cfg: &Config, jira: &Jira, date: NaiveDate, today: NaiveDate, fa
         log::info!("suggest {:?}: {} min (raw {} min, {} evidence)", s.bucket, s.minutes, s.raw_minutes, s.evidence.len());
     }
     let mut rows = Vec::new();
+    let issue_count = suggestions.iter().filter(|s| matches!(s.bucket, Bucket::Issue(_))).count();
+    progress(Progress::Step(format!("looking up {issue_count} tickets in Jira")));
     for s in suggestions {
         let issue = match &s.bucket {
             Bucket::Issue(k) => match jira.issue(k) {
@@ -125,6 +209,7 @@ pub fn build_at(cfg: &Config, jira: &Jira, date: NaiveDate, today: NaiveDate, fa
     }
 
     let candidates = if rows.iter().any(|r| r.issue.is_none()) {
+        progress(Progress::Step("listing your open tickets".into()));
         jira.candidates(&cfg.project_keys, 30).unwrap_or_else(|e| {
             warnings.push(format!("listing your open issues: {e:#}"));
             Vec::new()

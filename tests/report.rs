@@ -544,6 +544,231 @@ mod repo_projects {
     }
 }
 
+mod progress {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use worklog::git::ScanEvent;
+    use worklog::report::Progress;
+
+    /// Repos `alpha` (ABC-1 api at 10:00, `extra` at 11:00) and `beta` (XYZ-2 db at 12:00) under one
+    /// root; `extra` is "cleanup" (no key: an unassigned row) or "ABC-1 more" (every row ticketed).
+    fn two_repos(tmp: &tempfile::TempDir, extra: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let d = day(D.0, D.1, D.2);
+        let setup = local_at(day(2026, 11, 1), 8, 0, 0);
+        let root = tmp.path().join("root");
+        let (alpha, beta) = (root.join("alpha"), root.join("beta"));
+        for r in [&alpha, &beta] {
+            init_repo(r, &setup);
+            commit(r, &setup, "init", "");
+        }
+        commit(&alpha, &local_at(d, 10, 0, 0), "ABC-1 api", "");
+        commit(&alpha, &local_at(d, 11, 0, 0), extra, "");
+        commit(&beta, &local_at(d, 12, 0, 0), "XYZ-2 db", "");
+        (root, alpha, beta)
+    }
+
+    fn cfg(root: &Path) -> Config {
+        Config {
+            repo_roots: vec![root.to_path_buf()],
+            author_emails: vec![common::ME.into()],
+            project_keys: vec!["ABC".into(), "XYZ".into()],
+            ctx_env_file: None,
+            jira_url: None,
+            ..Config::default()
+        }
+    }
+
+    /// Runs `build_at_with` for D (not today), returning the result and every Progress heard.
+    fn build(cfg: &Config, mock: &MockJira) -> (anyhow::Result<report::Report>, Vec<Progress>) {
+        common::empty_git_config();
+        let heard = Mutex::new(Vec::new());
+        let d = day(D.0, D.1, D.2);
+        let r = report::build_at_with(cfg, &Jira::new(&mock.base, "tok"), d, day(2026, 11, 10), None, &|p| heard.lock().unwrap().push(p));
+        (r, heard.into_inner().unwrap())
+    }
+
+    fn step(s: &str) -> Progress {
+        Progress::Step(s.into())
+    }
+
+    /// The progress without the git scan events.
+    fn steps(heard: &[Progress]) -> Vec<Progress> {
+        heard.iter().filter(|p| !matches!(p, Progress::Scan(_))).cloned().collect()
+    }
+
+    /// The scan events of each repo: (Started count, Finished event counts).
+    fn scans_of(heard: &[Progress], repo: &Path) -> (usize, Vec<Option<usize>>) {
+        let started = heard.iter().filter(|p| matches!(p, Progress::Scan(ScanEvent::Started(r)) if r == repo)).count();
+        let finished = heard
+            .iter()
+            .filter_map(|p| match p {
+                Progress::Scan(ScanEvent::Finished { repo: r, events, .. }) if r == repo => Some(*events),
+                _ => None,
+            })
+            .collect();
+        (started, finished)
+    }
+
+    /// Scan events sit between `Scanning` and the next step, and nowhere else.
+    fn assert_scans_inside_the_git_step(heard: &[Progress]) {
+        let scanning = heard.iter().position(|p| matches!(p, Progress::Scanning(_))).expect("Scanning");
+        let after = heard.iter().skip(scanning + 1).position(|p| !matches!(p, Progress::Scan(_))).map(|i| i + scanning + 1).unwrap_or(heard.len());
+        let scans = heard.iter().filter(|p| matches!(p, Progress::Scan(_))).count();
+        assert_eq!(after - scanning - 1, scans, "{heard:?}");
+    }
+
+    #[test]
+    fn steps_in_order_with_each_repos_scan_inside_the_git_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, alpha, beta) = two_repos(&tmp, "cleanup");
+        let (r, heard) = build(&cfg(&root), &mock_all_known());
+        let r = r.unwrap();
+        assert!(r.rows.iter().any(|x| x.issue.is_none()), "fixture: the cleanup row has no issue");
+        assert_eq!(
+            steps(&heard),
+            vec![
+                step("asking Jira who you are"),
+                Progress::Scanning(2),
+                step("reading what you logged on 2026-11-04"),
+                step("looking up 2 tickets in Jira"),
+                step("listing your open tickets"),
+            ]
+        );
+        assert_scans_inside_the_git_step(&heard);
+        assert_eq!(scans_of(&heard, &alpha), (1, vec![Some(2)]));
+        assert_eq!(scans_of(&heard, &beta), (1, vec![Some(1)]));
+        assert_eq!(heard.len(), 5 + 4);
+    }
+
+    #[test]
+    fn no_open_tickets_step_when_every_row_has_its_issue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, alpha, beta) = two_repos(&tmp, "ABC-1 more");
+        let (r, heard) = build(&cfg(&root), &mock_all_known());
+        assert!(r.unwrap().rows.iter().all(|x| x.issue.is_some()));
+        assert_eq!(
+            steps(&heard),
+            vec![step("asking Jira who you are"), Progress::Scanning(2), step("reading what you logged on 2026-11-04"), step("looking up 2 tickets in Jira")]
+        );
+        assert_scans_inside_the_git_step(&heard);
+        assert_eq!((scans_of(&heard, &alpha), scans_of(&heard, &beta)), ((1, vec![Some(2)]), (1, vec![Some(1)])));
+    }
+
+    #[test]
+    fn no_repos_scans_nothing_and_counts_no_tickets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("empty");
+        std::fs::create_dir_all(&root).unwrap();
+        let (r, heard) = build(&cfg(&root), &mock_all_known());
+        r.unwrap();
+        assert_eq!(
+            heard,
+            vec![step("asking Jira who you are"), Progress::Scanning(0), step("reading what you logged on 2026-11-04"), step("looking up 0 tickets in Jira")]
+        );
+    }
+
+    #[test]
+    fn a_failing_jira_stops_the_steps_where_it_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, alpha, beta) = two_repos(&tmp, "cleanup");
+
+        let myself_down = MockJira::start(|_, _, _| (500, json!({"errorMessages": ["down"]}).to_string()));
+        let (r, heard) = build(&cfg(&root), &myself_down);
+        assert_eq!(r.err().map(|e| format!("{e:#}")).as_deref(), Some("Jira 500 on /rest/api/2/myself: down"));
+        assert_eq!(heard, vec![step("asking Jira who you are")]);
+
+        let search_down = MockJira::start(|_, url, _| match path_of(url) {
+            "/rest/api/2/myself" => (200, json!({"name": "jdoe"}).to_string()),
+            _ => (500, json!({"errorMessages": ["search down"]}).to_string()),
+        });
+        let (r, heard) = build(&cfg(&root), &search_down);
+        let jql = jira::url_encode(r#"worklogAuthor = currentUser() AND worklogDate = "2026-11-04""#);
+        assert_eq!(
+            r.err().map(|e| format!("{e:#}")),
+            Some(format!("Jira 500 on /rest/api/2/search?jql={jql}&fields=summary,status&maxResults=100: search down"))
+        );
+        assert_eq!(steps(&heard), vec![step("asking Jira who you are"), Progress::Scanning(2), step("reading what you logged on 2026-11-04")]);
+        assert_eq!((scans_of(&heard, &alpha), scans_of(&heard, &beta)), ((1, vec![Some(2)]), (1, vec![Some(1)])));
+    }
+}
+
+mod load_progress {
+    use std::path::PathBuf;
+    use worklog::git::ScanEvent;
+    use worklog::report::{LoadProgress, Progress};
+
+    /// Not reading git: `scanning` false.
+    fn state(step: &str, total: usize, done: usize, active: &[&str]) -> LoadProgress {
+        LoadProgress { step: step.into(), scanning: false, total, done, active: active.iter().map(|s| s.to_string()).collect() }
+    }
+
+    /// Reading git after `Scanning`: step "reading git", `scanning` true.
+    fn git(total: usize, done: usize, active: &[&str]) -> LoadProgress {
+        LoadProgress { scanning: true, ..state("reading git", total, done, active) }
+    }
+
+    fn started(p: &str) -> Progress {
+        Progress::Scan(ScanEvent::Started(PathBuf::from(p)))
+    }
+
+    fn finished(p: &str, events: Option<usize>) -> Progress {
+        Progress::Scan(ScanEvent::Finished { repo: PathBuf::from(p), events, secs: 1.25 })
+    }
+
+    #[test]
+    fn starts_empty_with_the_starting_label() {
+        let p = LoadProgress::default();
+        assert_eq!(p, state("", 0, 0, &[]));
+        assert_eq!(p.label(), "starting…");
+    }
+
+    #[test]
+    fn apply_moves_the_state_and_the_label_follows() {
+        // (name, before, event, after, label after)
+        let rows: Vec<(&str, LoadProgress, Progress, LoadProgress, &str)> = vec![
+            ("first step", state("", 0, 0, &[]), Progress::Step("asking Jira who you are".into()), state("asking Jira who you are", 0, 0, &[]), "asking Jira who you are…"),
+            ("scanning resets count and active", state("asking Jira who you are", 9, 4, &["old"]), Progress::Scanning(7), git(7, 0, &[]), "reading git: 0/7 repos"),
+            ("started adds the dir name", git(7, 0, &[]), started(r"D:\work\alpha"), git(7, 0, &["alpha"]), "reading git: 0/7 repos · now: alpha"),
+            ("second start goes last", git(7, 0, &["alpha"]), started(r"D:\work\group\xyz"), git(7, 0, &["alpha", "xyz"]), "reading git: 0/7 repos · now: alpha, xyz"),
+            ("finished removes it and counts", git(7, 2, &["alpha", "xyz", "beta"]), finished(r"D:\other\xyz", Some(4)), git(7, 3, &["alpha", "beta"]), "reading git: 3/7 repos · now: alpha, beta"),
+            ("failed repo counts as done", git(7, 3, &["beta"]), finished(r"D:\work\beta", None), git(7, 4, &[]), "reading git: 4/7 repos"),
+            ("same name twice: one goes", git(7, 1, &["svc", "alpha", "svc"]), finished(r"D:\b\svc", Some(0)), git(7, 2, &["alpha", "svc"]), "reading git: 2/7 repos · now: alpha, svc"),
+            ("unknown repo still counts", git(7, 5, &["alpha"]), finished(r"D:\work\zeta", Some(1)), git(7, 6, &["alpha"]), "reading git: 6/7 repos · now: alpha"),
+            ("path without a dir name", git(2, 0, &[]), started("D:\\"), git(2, 0, &["D:\\"]), "reading git: 0/2 repos · now: D:\\"),
+            ("step after git keeps counts, drops active", git(7, 6, &["alpha"]), Progress::Step("reading what you logged on 2026-11-04".into()), state("reading what you logged on 2026-11-04", 7, 6, &[]), "reading what you logged on 2026-11-04…"),
+            ("scanning nothing", state("asking Jira who you are", 0, 0, &[]), Progress::Scanning(0), git(0, 0, &[]), "reading git: 0/0 repos"),
+            ("a step named reading git is a plain step", state("", 0, 0, &[]), Progress::Step("reading git".into()), state("reading git", 0, 0, &[]), "reading git…"),
+            ("a step named reading git ends a scan", git(4, 2, &["alpha"]), Progress::Step("reading git".into()), state("reading git", 4, 2, &[]), "reading git…"),
+            ("a repo outside a scan is listed, not shown", state("asking Jira who you are", 0, 0, &[]), started(r"D:\work\alpha"), state("asking Jira who you are", 0, 0, &["alpha"]), "asking Jira who you are…"),
+        ];
+        for (name, mut p, event, after, label) in rows {
+            p.apply(event);
+            assert_eq!(p, after, "{name}");
+            assert_eq!(p.label(), label, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_whole_scan_ends_with_every_repo_done_and_none_active() {
+        let mut p = LoadProgress::default();
+        for e in [
+            Progress::Step("asking Jira who you are".into()),
+            Progress::Scanning(3),
+            started(r"D:\r\alpha"),
+            started(r"D:\r\beta"),
+            finished(r"D:\r\beta", Some(2)),
+            started(r"D:\r\xyz"),
+            finished(r"D:\r\alpha", None),
+        ] {
+            p.apply(e);
+        }
+        assert_eq!(p.label(), "reading git: 2/3 repos · now: xyz");
+        p.apply(finished(r"D:\r\xyz", Some(0)));
+        assert_eq!((p.label(), p), ("reading git: 3/3 repos".to_string(), git(3, 3, &[])));
+    }
+}
+
 #[test]
 fn build_without_repos_warns_and_has_no_activity() {
     let tmp = tempfile::tempdir().unwrap();

@@ -93,30 +93,66 @@ pub struct Collector<'a> {
     pub include_uncommitted: bool,
 }
 
+/// Repos read at once. All at once (23 here) made each git call wait on the others: single repos
+/// took up to a minute. A few at a time keeps the disk and CPU busy without that contention.
+pub const PARALLEL_REPOS: usize = 5;
+
+/// What `Collector::collect_with` reports while it reads.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScanEvent {
+    Started(PathBuf),
+    /// A repo is read: its event count, or `None` when reading it failed.
+    Finished { repo: PathBuf, events: Option<usize>, secs: f64 },
+}
+
 const FS: char = '\u{1f}';
 const RS: char = '\u{1e}';
 
 impl Collector<'_> {
     /// Events of all repos. Commits reachable from several repos (forks, copies) count once.
     pub fn collect(&self, repos: &[PathBuf]) -> (Vec<Event>, Vec<String>) {
-        // Repos are read in parallel (each costs a few git processes, ~0.4 s on Windows); the
-        // cross-repo dedup then runs in repo order, so the first repo still wins a shared commit.
-        let raw: Vec<Result<RawRepo>> = std::thread::scope(|s| {
-            let handles: Vec<_> = repos
-                .iter()
-                .map(|repo| {
-                    s.spawn(move || {
+        self.collect_with(repos, &|_| {})
+    }
+
+    /// `collect`, reading `PARALLEL_REPOS` repos at a time and telling `on_event` as each starts
+    /// and finishes (from the reader threads). A panic while reading a repo becomes that repo's
+    /// error; `on_event` itself must not panic, or the whole scan does.
+    pub fn collect_with(&self, repos: &[PathBuf], on_event: &(dyn Fn(ScanEvent) + Sync)) -> (Vec<Event>, Vec<String>) {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Results go to their repo's slot: the cross-repo dedup below runs in repo order, so the
+        // first repo still wins a shared commit whatever order the threads finish in.
+        let slots: Vec<Mutex<Option<Result<RawRepo>>>> = repos.iter().map(|_| Mutex::new(None)).collect();
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..PARALLEL_REPOS.min(repos.len()) {
+                s.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(repo) = repos.get(i) else { break };
+                        on_event(ScanEvent::Started(repo.clone()));
                         let t = std::time::Instant::now();
-                        let r = self.collect_raw(repo);
-                        if let Ok((c, o)) = &r {
-                            log::info!("  {}: {} events ({:.2}s)", repo.display(), c.len() + o.len(), t.elapsed().as_secs_f64());
+                        // A panic on one odd repo must cost that repo only, not the whole scan
+                        // (`thread::scope` would re-raise it).
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.collect_raw(repo)))
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("reader thread panicked")));
+                        let secs = t.elapsed().as_secs_f64();
+                        let events = r.as_ref().ok().map(|(c, o)| c.len() + o.len());
+                        if let Some(n) = events {
+                            log::info!("  {}: {n} events ({secs:.2}s)", repo.display());
                         }
-                        r
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("reader thread panicked")))).collect()
+                        on_event(ScanEvent::Finished { repo: repo.clone(), events, secs });
+                        if let Ok(mut slot) = slots[i].lock() {
+                            *slot = Some(r);
+                        }
+                    }
+                });
+            }
         });
+        let raw: Vec<Result<RawRepo>> = slots
+            .into_iter()
+            .map(|m| m.into_inner().ok().flatten().unwrap_or_else(|| Err(anyhow::anyhow!("reader thread panicked"))))
+            .collect();
 
         let mut events = Vec::new();
         let mut errors = Vec::new();

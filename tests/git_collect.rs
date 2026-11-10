@@ -430,6 +430,292 @@ mod uncommitted {
     }
 }
 
+mod collect_with {
+    use super::*;
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+    use worklog::git::{PARALLEL_REPOS, ScanEvent};
+
+    /// Long enough for any git call here; a wait that runs out lets the scan go on, so a wrong
+    /// implementation fails an assertion instead of hanging.
+    const WAIT: Duration = Duration::from_secs(20);
+
+    #[derive(Default)]
+    struct Seen {
+        /// Every event with `secs` zeroed, in the order the callback heard them.
+        log: Vec<ScanEvent>,
+        running: usize,
+        peak: usize,
+        started: usize,
+    }
+
+    /// Records what `collect_with` reports. `gate(repo)` names what a repo's `Started` waits for
+    /// before the read goes on: a number of repos started, or another repo finished.
+    struct Probe {
+        seen: Mutex<Seen>,
+        cv: Condvar,
+        gate: Box<dyn Fn(&Path) -> Gate + Sync>,
+    }
+
+    enum Gate {
+        Open,
+        StartedAtLeast(usize),
+        FinishedFirst(PathBuf),
+    }
+
+    impl Probe {
+        fn new(gate: impl Fn(&Path) -> Gate + Sync + 'static) -> Self {
+            Self { seen: Mutex::new(Seen::default()), cv: Condvar::new(), gate: Box::new(gate) }
+        }
+
+        fn on_event(&self, e: ScanEvent) {
+            let mut s = self.seen.lock().unwrap();
+            match e {
+                ScanEvent::Started(repo) => {
+                    s.started += 1;
+                    s.running += 1;
+                    s.peak = s.peak.max(s.running);
+                    s.log.push(ScanEvent::Started(repo.clone()));
+                    self.cv.notify_all();
+                    let ready = |s: &mut Seen| match (self.gate)(&repo) {
+                        Gate::Open => true,
+                        Gate::StartedAtLeast(n) => s.started >= n,
+                        Gate::FinishedFirst(other) => s.log.iter().any(|x| matches!(x, ScanEvent::Finished { repo, .. } if *repo == other)),
+                    };
+                    let _ = self.cv.wait_timeout_while(s, WAIT, |s| !ready(s)).unwrap();
+                }
+                ScanEvent::Finished { repo, events, .. } => {
+                    s.running -= 1;
+                    s.log.push(ScanEvent::Finished { repo, events, secs: 0.0 });
+                    self.cv.notify_all();
+                }
+            }
+        }
+
+        fn scan(&self, repos: &[PathBuf]) -> (Vec<Event>, Vec<String>) {
+            common::empty_git_config();
+            let m = matcher();
+            let emails = vec![ME.to_string()];
+            Collector { matcher: &m, author_emails: &emails, date: d(), include_uncommitted: false }.collect_with(repos, &|e| self.on_event(e))
+        }
+
+        fn log(&self) -> Vec<ScanEvent> {
+            self.seen.lock().unwrap().log.clone()
+        }
+
+        /// The repos in the order they finished.
+        fn finish_order(&self) -> Vec<PathBuf> {
+            self.log().into_iter().filter_map(|e| if let ScanEvent::Finished { repo, .. } = e { Some(repo) } else { None }).collect()
+        }
+    }
+
+    fn finished(repo: &Path, events: Option<usize>) -> ScanEvent {
+        ScanEvent::Finished { repo: repo.to_path_buf(), events, secs: 0.0 }
+    }
+
+    /// Seven repos `r0`..`r6`; repo `ri` has i commits on D (r0 none), so each has its own count.
+    fn seven_repos(tmp: &Path) -> Vec<PathBuf> {
+        (0..7)
+            .map(|i| {
+                let r = new_repo(tmp, &format!("r{i}"));
+                for j in 0..i {
+                    commit(&r, &at(d(), 9 + i as u32, j as u32, 0), &format!("ABC-{} r{i} work {j}", 100 + i), "");
+                }
+                r
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reads_parallel_repos_at_a_time_and_reports_each_repo_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = seven_repos(tmp.path());
+        // Every Started waits until PARALLEL_REPOS repos have started: the peak reaches exactly
+        // PARALLEL_REPOS when that many are read at once, and goes past it when more are.
+        let probe = Probe::new(|_| Gate::StartedAtLeast(PARALLEL_REPOS));
+        let (events, errors) = probe.scan(&repos);
+
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(events.len(), 21, "0 + 1 + .. + 6 commits");
+        let s = probe.seen.lock().unwrap();
+        assert_eq!((s.peak, s.running, s.started), (PARALLEL_REPOS, 0, 7));
+        assert_eq!(s.log.len(), 14, "{:?}", s.log);
+        for (i, repo) in repos.iter().enumerate() {
+            let started = s.log.iter().position(|e| *e == ScanEvent::Started(repo.clone()));
+            let done = s.log.iter().position(|e| *e == finished(repo, Some(i)));
+            assert!(matches!((started, done), (Some(a), Some(b)) if a < b), "r{i}: {started:?} {done:?} in {:?}", s.log);
+        }
+    }
+
+    #[test]
+    fn parallel_repos_is_five() {
+        assert_eq!(PARALLEL_REPOS, 5);
+    }
+
+    #[test]
+    fn same_result_as_collect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = seven_repos(tmp.path());
+        let probe = Probe::new(|_| Gate::Open);
+        assert_eq!(probe.scan(&repos), collect_with(&repos, &[ME], false));
+    }
+
+    #[test]
+    fn a_shared_commit_goes_to_the_first_repo_in_the_list_even_when_it_finishes_last() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = new_repo(tmp.path(), "orig");
+        commit(&orig, &at(d(), 10, 0, 0), "ABC-5 shared", "");
+        let copy = tmp.path().join("copy");
+        git_at(tmp.path(), &at(before(1), 9, 0, 0), &["clone", "-q", orig.to_str().unwrap(), copy.to_str().unwrap()]);
+        commit(&copy, &at(d(), 11, 0, 0), "ABC-6 only in copy", "");
+        commit(&orig, &at(d(), 12, 0, 0), "ABC-7 only in orig", "");
+
+        // `copy` is first in the list but waits for `orig` to finish before it is read.
+        let orig_done = orig.clone();
+        let copy_slow = copy.clone();
+        let probe = Probe::new(move |r| if r == copy_slow { Gate::FinishedFirst(orig_done.clone()) } else { Gate::Open });
+        let (events, errors) = probe.scan(&[copy.clone(), orig.clone()]);
+
+        assert_eq!(probe.finish_order(), vec![orig.clone(), copy.clone()], "fixture: the first repo finishes last");
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(
+            events,
+            vec![
+                event("copy", at(d(), 10, 0, 0), EventKind::Commit, "ABC-5 shared", Some("ABC-5")),
+                event("copy", at(d(), 11, 0, 0), EventKind::Commit, "ABC-6 only in copy", Some("ABC-6")),
+                event("orig", at(d(), 12, 0, 0), EventKind::Commit, "ABC-7 only in orig", Some("ABC-7")),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_repos_finish_without_a_count_and_their_errors_keep_the_list_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good_a = new_repo(tmp.path(), "alpha");
+        commit(&good_a, &at(d(), 10, 0, 0), "ABC-1 alpha", "");
+        let bad_1 = tmp.path().join("bad-one");
+        let good_b = new_repo(tmp.path(), "beta");
+        commit(&good_b, &at(d(), 11, 0, 0), "XYZ-2 beta", "");
+        commit(&good_b, &at(d(), 11, 30, 0), "XYZ-3 beta", "");
+        let bad_2 = tmp.path().join("bad-two");
+        for bad in [&bad_1, &bad_2] {
+            std::fs::create_dir_all(bad).unwrap();
+        }
+        let repos = vec![good_a.clone(), bad_1.clone(), good_b.clone(), bad_2.clone()];
+
+        // The first failing repo is read only after the second one failed.
+        let (first, second) = (bad_1.clone(), bad_2.clone());
+        let probe = Probe::new(move |r| if r == first { Gate::FinishedFirst(second.clone()) } else { Gate::Open });
+        let (events, errors) = probe.scan(&repos);
+
+        let order = probe.finish_order();
+        let pos = |r: &PathBuf| order.iter().position(|x| x == r).unwrap();
+        assert!(pos(&bad_2) < pos(&bad_1), "fixture: bad-two fails first: {order:?}");
+        assert_eq!(
+            events,
+            vec![
+                event("alpha", at(d(), 10, 0, 0), EventKind::Commit, "ABC-1 alpha", Some("ABC-1")),
+                event("beta", at(d(), 11, 0, 0), EventKind::Commit, "XYZ-2 beta", Some("XYZ-2")),
+                event("beta", at(d(), 11, 30, 0), EventKind::Commit, "XYZ-3 beta", Some("XYZ-3")),
+            ]
+        );
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        // After "<repo>: " comes the git command and git's own stderr.
+        assert!(errors[0].starts_with(&format!("{}: ", bad_1.display())), "{errors:?}");
+        assert!(errors[1].starts_with(&format!("{}: ", bad_2.display())), "{errors:?}");
+        // Finish order is up to the threads; compare in list order.
+        let log = probe.log();
+        let finish_of = |r: &PathBuf| log.iter().filter(|e| matches!(e, ScanEvent::Finished { repo, .. } if repo == r)).cloned().collect::<Vec<_>>();
+        assert_eq!(
+            repos.iter().flat_map(finish_of).collect::<Vec<_>>(),
+            vec![finished(&good_a, Some(1)), finished(&bad_1, None), finished(&good_b, Some(2)), finished(&bad_2, None)]
+        );
+        assert_eq!(log.len(), 8, "{log:?}");
+    }
+
+    /// Directory name whose reading panics: the logger below panics on any record naming it, and
+    /// every git call `collect_raw` makes logs its `-C <repo>` at debug level.
+    const PANICS: &str = "panic-on-read";
+
+    struct PanickingLogger;
+
+    impl log::Log for PanickingLogger {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, r: &log::Record) {
+            if r.args().to_string().contains(PANICS) {
+                panic!("logger refuses {PANICS}");
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    /// Installs `PanickingLogger` for this test binary; harmless to every other test here.
+    fn panicking_logger() {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            log::set_boxed_logger(Box::new(PanickingLogger)).expect("no other logger in this test binary");
+            log::set_max_level(log::LevelFilter::Debug);
+        });
+    }
+
+    #[test]
+    fn a_panic_while_reading_one_repo_costs_that_repo_only() {
+        panicking_logger();
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = new_repo(tmp.path(), "alpha");
+        commit(&alpha, &at(d(), 10, 0, 0), "ABC-1 alpha", "");
+        let panicky = new_repo(tmp.path(), PANICS);
+        commit(&panicky, &at(d(), 10, 30, 0), "ABC-2 lost with the panic", "");
+        let beta = new_repo(tmp.path(), "beta");
+        commit(&beta, &at(d(), 11, 0, 0), "XYZ-3 beta", "");
+        let not_repo = tmp.path().join("not-a-repo");
+        std::fs::create_dir_all(&not_repo).unwrap();
+        let repos = vec![alpha.clone(), panicky.clone(), beta.clone(), not_repo.clone()];
+
+        let probe = Probe::new(|_| Gate::Open);
+        let (events, errors) = probe.scan(&repos);
+
+        assert_eq!(
+            events,
+            vec![
+                event("alpha", at(d(), 10, 0, 0), EventKind::Commit, "ABC-1 alpha", Some("ABC-1")),
+                event("beta", at(d(), 11, 0, 0), EventKind::Commit, "XYZ-3 beta", Some("XYZ-3")),
+            ]
+        );
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert_eq!(errors[0], format!("{}: reader thread panicked", panicky.display()));
+        // The rest of this one is the git command and git's own stderr.
+        assert!(errors[1].starts_with(&format!("{}: ", not_repo.display())), "{errors:?}");
+        let log = probe.log();
+        let finish_of = |r: &PathBuf| log.iter().filter(|e| matches!(e, ScanEvent::Finished { repo, .. } if repo == r)).cloned().collect::<Vec<_>>();
+        assert_eq!(
+            repos.iter().flat_map(finish_of).collect::<Vec<_>>(),
+            vec![finished(&alpha, Some(1)), finished(&panicky, None), finished(&beta, Some(1)), finished(&not_repo, None)]
+        );
+        assert_eq!(log.len(), 8, "{log:?}");
+    }
+
+    #[test]
+    fn no_repos_no_events_and_no_callbacks() {
+        let probe = Probe::new(|_| Gate::Open);
+        assert_eq!(probe.scan(&[]), (vec![], vec![]));
+        assert_eq!(probe.log(), vec![]);
+    }
+
+    #[test]
+    fn a_single_repo_is_reported_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = new_repo(tmp.path(), "solo");
+        commit(&r, &at(d(), 10, 0, 0), "ABC-9 solo", "");
+        let probe = Probe::new(|_| Gate::Open);
+        let (events, errors) = probe.scan(std::slice::from_ref(&r));
+        assert_eq!((events.len(), errors), (1, vec![]));
+        assert_eq!(probe.log(), vec![ScanEvent::Started(r.clone()), finished(&r, Some(1))]);
+    }
+}
+
 mod discover {
     use super::*;
 

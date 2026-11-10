@@ -33,9 +33,12 @@ pub fn init(stderr: Option<LevelFilter>) -> Option<PathBuf> {
         let f = if big { File::create(p) } else { OpenOptions::new().create(true).append(true).open(p) };
         f.ok().map(Mutex::new)
     });
+    let opened = file.is_some();
     let logger = Logger { stderr, file };
     if log::set_boxed_logger(Box::new(logger)).is_ok() {
         log::set_max_level(LevelFilter::Debug);
+        let (level, line) = first_line(path.as_deref(), opened);
+        log::log!(level, "{line}");
         // The scheduled popup has no console: without this a panic (in the GUI or a worker
         // thread) leaves the log ending mid-run with no reason.
         let default_hook = std::panic::take_hook();
@@ -47,6 +50,15 @@ pub fn init(stderr: Option<LevelFilter>) -> Option<PathBuf> {
         }));
     }
     path
+}
+
+/// The first line of every run: where the log goes. `opened`: the file could be opened.
+pub fn first_line(path: Option<&std::path::Path>, opened: bool) -> (Level, String) {
+    match (path, opened) {
+        (Some(p), true) => (Level::Info, format!("log file: {}", p.display())),
+        (Some(p), false) => (Level::Warn, format!("log file: {} cannot be opened; logging to the console only", p.display())),
+        (None, _) => (Level::Warn, "log file: none (no config directory); logging to the console only".to_owned()),
+    }
 }
 
 impl Log for Logger {

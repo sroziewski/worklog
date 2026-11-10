@@ -61,7 +61,7 @@ fn manual_row(minutes: u32) -> Row {
 pub type Projects = Vec<(String, String)>;
 
 enum Phase {
-    Loading(Receiver<Result<(Report, Projects)>>),
+    Loading(Receiver<Result<(Report, Projects)>>, Receiver<report::Progress>, report::LoadProgress),
     Failed(String),
     Ready,
     Posting(Receiver<(usize, Posted)>, usize),
@@ -96,6 +96,37 @@ fn open_history() -> Result<std::sync::Arc<History>, String> {
         Err(e) => log::warn!("ticket history: pruning: {e:#}"),
     }
     Ok(std::sync::Arc::new(h))
+}
+
+/// What the window loads before it can show anything: the report, the open tickets for rows
+/// without one, and the project names, telling `progress` each step.
+pub fn load(
+    cfg: &Config,
+    jira: &Jira,
+    date: NaiveDate,
+    today: NaiveDate,
+    fallback_email: Option<String>,
+    progress: &(dyn Fn(report::Progress) + Sync),
+) -> Result<(Report, Projects)> {
+    let mut r = report::build_at_with(cfg, jira, date, today, fallback_email, progress)?;
+    // The report skips this list when every row has a ticket, but rows added with "+" need it too.
+    if r.rows.iter().all(|row| row.issue.is_some()) {
+        progress(report::Progress::Step("listing your open tickets".into()));
+        match jira.candidates(&cfg.project_keys, 30) {
+            Ok(list) => r.candidates = list,
+            Err(e) => log::warn!("listing your open issues: {e:#}"),
+        }
+    }
+    progress(report::Progress::Step("reading project names".into()));
+    let projects = picker_projects(cfg, jira);
+    Ok((r, projects))
+}
+
+/// Takes in every progress message waiting on `rx`.
+pub fn drain_progress(rx: &Receiver<report::Progress>, into: &mut report::LoadProgress) {
+    while let Ok(p) = rx.try_recv() {
+        into.apply(p);
+    }
 }
 
 /// The configured projects in config order, labelled with Jira's project name, all of them
@@ -146,29 +177,22 @@ pub fn run(cfg: Config, creds: JiraCredentials, date: NaiveDate, state_path: Opt
 impl WorklogApp {
     fn new(cfg: Config, creds: JiraCredentials, date: NaiveDate, state_path: Option<PathBuf>) -> Self {
         let (tx, rx) = channel();
+        let (ptx, prx) = channel();
         let (c, cr) = (cfg.clone(), creds.clone());
         std::thread::spawn(move || {
             let jira = Jira::new(&cr.url, &cr.token);
-            let res = report::build(&c, &jira, date).map(|mut r| {
-                // The report skips this list when every row has a ticket, but rows added with "+"
-                // need it too.
-                if r.candidates.is_empty() {
-                    match jira.candidates(&c.project_keys, 30) {
-                        Ok(list) => r.candidates = list,
-                        Err(e) => log::warn!("listing your open issues: {e:#}"),
-                    }
-                }
-                let projects = picker_projects(&c, &jira);
-                (r, projects)
-            });
-            let _ = tx.send(res);
+            let progress = |p: report::Progress| {
+                let _ = ptx.send(p);
+            };
+            let today = chrono::Local::now().date_naive();
+            let _ = tx.send(load(&c, &jira, date, today, crate::git::global_user_email(), &progress));
         });
         Self {
             cfg,
             creds,
             state_path,
             date,
-            phase: Phase::Loading(rx),
+            phase: Phase::Loading(rx, prx, report::LoadProgress::default()),
             report: None,
             rows: Vec::new(),
             projects: Vec::new(),
@@ -272,8 +296,11 @@ impl WorklogApp {
     }
 
     fn poll(&mut self) {
+        if let Phase::Loading(_, prx, progress) = &mut self.phase {
+            drain_progress(prx, progress);
+        }
         match &mut self.phase {
-            Phase::Loading(rx) => match rx.try_recv() {
+            Phase::Loading(rx, _, _) => match rx.try_recv() {
                 Ok(Ok((report, projects))) => {
                     let ids = &mut self.row_ids;
                     self.rows = report
@@ -517,7 +544,7 @@ impl eframe::App for WorklogApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
         let ctx = ui.ctx().clone();
-        if matches!(self.phase, Phase::Loading(_) | Phase::Posting(..)) {
+        if matches!(self.phase, Phase::Loading(..) | Phase::Posting(..)) {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
@@ -556,9 +583,9 @@ impl eframe::App for WorklogApp {
                             }
                         });
                     }
-                    Phase::Loading(_) => {
+                    Phase::Loading(_, _, progress) => {
                         ui.spinner();
-                        ui.label("Reading git activity and Jira…");
+                        ui.label(progress.label());
                     }
                     Phase::Posting(_, n) => {
                         ui.spinner();

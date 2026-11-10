@@ -90,6 +90,44 @@ pub fn ticked_lines<'a>(groups: &'a [WorkGroup], ticks: &BTreeSet<(u64, usize)>,
         .collect()
 }
 
+/// Creates each job's ticket in turn and records every created one in `history` with its
+/// `sources` (the same position in `sources` as the job in `jobs`) and the time `now` gives once
+/// it is created. `on_result` hears each outcome as (draft index, key or error); returning false
+/// stops the rest.
+pub fn create_tickets(
+    jira: &Jira,
+    history: Option<&History>,
+    jobs: Vec<(usize, NewIssue)>,
+    sources: Vec<Vec<WorkItem>>,
+    language: &str,
+    now: impl Fn() -> i64,
+    mut on_result: impl FnMut(usize, Result<String, String>) -> bool,
+) {
+    let mut sources = sources.into_iter();
+    for (i, new) in jobs {
+        let item_sources = sources.next().unwrap_or_default();
+        let res = jira.create_issue(&new).map_err(|e| {
+            log::error!("creating ticket in {}: {e:#}", new.project);
+            let msg = format!("{e:#}");
+            if msg.contains("imeout") || msg.contains("timed out") {
+                format!("{msg} (Jira may still have created it; check before trying again)")
+            } else {
+                msg
+            }
+        });
+        if let (Ok(key), Some(h)) = (&res, history) {
+            if let Err(e) = h.record(&history::ticket_record(key, &new, language, item_sources, now())) {
+                log::warn!("ticket history: recording {key}: {e:#}");
+            } else {
+                log::info!("ticket history: recorded {key}");
+            }
+        }
+        if !on_result(i, res) {
+            return;
+        }
+    }
+}
+
 /// Where to look up the change of each ticked line: (its repos' paths, the line) and the day, or
 /// no paths and no day when no code is to be sent (`send_code` off or no report).
 pub fn change_lookup(ticked: &[(u64, &[String], &str)], code: Option<&CodeSource>, send_code: bool) -> (Vec<(Vec<PathBuf>, String)>, Option<NaiveDate>) {
@@ -325,26 +363,7 @@ impl Creator {
         let creds = creds.clone();
         std::thread::spawn(move || {
             let jira = Jira::new(&creds.url, &creds.token);
-            for ((i, new), sources) in jobs.into_iter().zip(sources) {
-                let res = jira.create_issue(&new).map_err(|e| {
-                    log::error!("creating ticket in {}: {e:#}", new.project);
-                    let msg = format!("{e:#}");
-                    if msg.contains("imeout") || msg.contains("timed out") {
-                        format!("{msg} (Jira may still have created it; check before trying again)")
-                    } else {
-                        msg
-                    }
-                });
-                if let (Ok(key), Some(h)) = (&res, &history) {
-                    let record = history::ticket_record(key, &new, &language, sources, chrono::Local::now().timestamp());
-                    if let Err(e) = h.record(&record) {
-                        log::warn!("ticket history: recording {key}: {e:#}");
-                    }
-                }
-                if tx.send((i, res)).is_err() {
-                    return;
-                }
-            }
+            create_tickets(&jira, history.as_deref(), jobs, sources, &language, || chrono::Local::now().timestamp(), |i, res| tx.send((i, res)).is_ok());
         });
         self.creating = Some(rx);
     }

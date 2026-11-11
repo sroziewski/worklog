@@ -87,13 +87,20 @@ pub struct WorklogApp {
 
 /// Opens the ticket history and drops records past its week. Another worklog window holding the
 /// file (redb locks it) only costs this window the history.
+// A held file is now waited for (`History::with_db`); an error here means it stayed held or
+// cannot be opened at all.
 fn open_history() -> Result<std::sync::Arc<History>, String> {
     let path = crate::history::default_path().ok_or("no config directory for the ticket history")?;
-    let h = History::open(&path).map_err(|e| format!("{e:#} (is another worklog window open?)"))?;
-    match h.prune(chrono::Local::now().timestamp()) {
+    let h = History::open(&path).map_err(|e| format!("{e:#}"))?;
+    let now = chrono::Local::now().timestamp();
+    match h.prune(now) {
         Ok(n) if n > 0 => log::info!("ticket history: {n} records older than {} days removed", crate::history::KEEP_DAYS),
         Ok(_) => {}
         Err(e) => log::warn!("ticket history: pruning: {e:#}"),
+    }
+    match h.recent(now) {
+        Ok(r) => log::info!("{}", crate::history::startup_line(r.len(), &path)),
+        Err(e) => log::warn!("ticket history: reading {}: {e:#}", path.display()),
     }
     Ok(std::sync::Arc::new(h))
 }
@@ -308,9 +315,14 @@ impl WorklogApp {
                         .iter()
                         .map(|r| RowState::new(ids.take(), r.issue.is_some() && r.suggestion.minutes > 0, r.suggestion.minutes, false))
                         .collect();
+                    let starter = flow::needs_starter_row(report.rows.len(), report.budget_minutes);
                     self.report = Some(report);
                     self.projects = projects;
                     self.phase = Phase::Ready;
+                    // A day without git activity still needs a way to log it: a row to pick a ticket for.
+                    if starter {
+                        self.add_row();
+                    }
                 }
                 Ok(Err(e)) => self.phase = Phase::Failed(format!("{e:#}")),
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -642,9 +654,17 @@ impl eframe::App for WorklogApp {
                 ui.colored_label(egui::Color32::from_rgb(190, 130, 20), format!("⚠ {w}"));
             }
             ui.separator();
-            if !report.has_activity() {
-                ui.label("No git activity found for this day.");
-                return;
+            let activity_rows = self.rows.iter().filter(|r| !r.manual).count();
+            match flow::day_view(activity_rows, self.rows.len(), self.unplanned_minutes()) {
+                flow::DayView::Full => {
+                    ui.label("No git activity found for this day, and the day is already full.");
+                    return;
+                }
+                flow::DayView::NoActivity => {
+                    ui.label("No git activity found for this day: pick the tickets you worked on from the list, set the hours, and Accept. \"+ Add row\" adds another.");
+                    ui.add_space(4.0);
+                }
+                flow::DayView::Activity => {}
             }
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.rows_ui(ui));
         });

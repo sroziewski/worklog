@@ -300,14 +300,57 @@ pub fn redraft_ticket(
     items: &[WorkItem],
     progress: &dyn Fn(Stage),
 ) -> Result<TicketDraft> {
-    let mut drafts = run(llm, project, language, items, Some(current), progress)?;
+    redraft_ticket_with(llm, project, language, current, items, "", progress)
+}
+
+/// `redraft_ticket` following the author's own `instructions` ("add a test case for an expired
+/// token", "shorter"), given to every step; blank means none.
+pub fn redraft_ticket_with(
+    llm: &dyn Chat,
+    project: &str,
+    language: &str,
+    current: &CurrentTicket,
+    items: &[WorkItem],
+    instructions: &str,
+    progress: &dyn Fn(Stage),
+) -> Result<TicketDraft> {
+    let mut drafts = run_steered(llm, project, language, items, Some(current), instructions, progress)?;
     Ok(drafts.swap_remove(0))
 }
 
+/// The author's instructions added to a step's prompts: the system prompt says how they rank,
+/// the user message ends with them. Unchanged when they are blank.
+pub fn steer(system: String, user: String, instructions: &str) -> (String, String) {
+    let i = instructions.trim();
+    if i.is_empty() {
+        return (system, user);
+    }
+    (
+        format!(
+            "{system} The ticket's author added instructions for this rewrite, given at the end: follow them, \
+             also over the style rules above, but never invent facts for them."
+        ),
+        format!("{user}\nAuthor's instructions:\n{i}\n"),
+    )
+}
+
 fn run(llm: &dyn Chat, project: &str, language: &str, items: &[WorkItem], current: Option<&CurrentTicket>, progress: &dyn Fn(Stage)) -> Result<Vec<TicketDraft>> {
+    run_steered(llm, project, language, items, current, "", progress)
+}
+
+fn run_steered(
+    llm: &dyn Chat,
+    project: &str,
+    language: &str,
+    items: &[WorkItem],
+    current: Option<&CurrentTicket>,
+    instructions: &str,
+    progress: &dyn Fn(Stage),
+) -> Result<Vec<TicketDraft>> {
     let max = if current.is_some() { 1 } else { MAX_DRAFTS };
     progress(Stage::Analyst);
     let (s, u) = analyst_prompt_for(project, items, current);
+    let (s, u) = steer(s, u, instructions);
     let analysis = json_answer(&llm.chat(&s, &u)?).context("analyst")?;
     let tasks = list(&analysis, "tasks");
     if tasks.is_empty() {
@@ -317,6 +360,7 @@ fn run(llm: &dyn Chat, project: &str, language: &str, items: &[WorkItem], curren
 
     progress(Stage::Writer);
     let (s, u) = writer_prompt_for(project, language, items, &analysis, current);
+    let (s, u) = steer(s, u, instructions);
     let written_v = json_answer(&llm.chat(&s, &u)?).context("ticket writer")?;
     let written: Vec<(Parts, Vec<usize>)> = list(&written_v, "tickets")
         .into_iter()
@@ -336,6 +380,7 @@ fn run(llm: &dyn Chat, project: &str, language: &str, items: &[WorkItem], curren
 
     progress(Stage::Tester);
     let (s, u) = tester_prompt(language, &analysis, &tickets_json);
+    let (s, u) = steer(s, u, instructions);
     let tests: Vec<Vec<String>> = match llm.chat(&s, &u).and_then(|a| json_answer(&a)) {
         Ok(v) => {
             let entries = list(&v, "tests");
@@ -365,6 +410,7 @@ fn run(llm: &dyn Chat, project: &str, language: &str, items: &[WorkItem], curren
         "title": p.title, "summary": p.summary, "criteria": p.criteria, "tests": p.tests.clone().unwrap_or_default()
     })).collect::<Vec<_>>() });
     let (s, u) = reviewer_prompt(language, items, &analysis, &review_input);
+    let (s, u) = steer(s, u, instructions);
     match llm.chat(&s, &u).and_then(|a| json_answer(&a)) {
         Ok(v) => {
             let reviewed = list(&v, "tickets");

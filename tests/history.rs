@@ -1,11 +1,12 @@
 //! The "My tickets" history: an embedded redb file in a temp dir, never the real config dir.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use redb::{Database, TableDefinition};
 use serde_json::json;
 use worklog::drafting::WorkItem;
-use worklog::history::{History, KEEP_DAYS, TicketRecord};
+use worklog::history::{self, History, KEEP_DAYS, TicketRecord};
 
 const DAY: i64 = 24 * 3600;
 /// 2026-11-10 12:00:00 UTC; `now` of every window test.
@@ -61,6 +62,17 @@ fn keep_days_is_a_week() {
     assert_eq!(KEEP_DAYS, 7);
 }
 
+#[test]
+fn startup_line_names_the_count_the_week_and_the_path() {
+    let p = Path::new(r"C:\Users\someone\AppData\Roaming\worklog\my tickets.redb");
+    for (count, expected) in [
+        (0, r"ticket history: 0 tickets from the last 7 days in C:\Users\someone\AppData\Roaming\worklog\my tickets.redb"),
+        (12, r"ticket history: 12 tickets from the last 7 days in C:\Users\someone\AppData\Roaming\worklog\my tickets.redb"),
+    ] {
+        assert_eq!(history::startup_line(count, p), expected);
+    }
+}
+
 mod open {
     use super::*;
 
@@ -76,15 +88,49 @@ mod open {
     }
 
     #[test]
-    fn second_open_of_the_same_file_fails_while_the_first_is_alive_and_works_after() {
+    fn two_handles_on_one_file_both_read_and_write_what_the_other_wrote() {
         let tmp = tempfile::tempdir().unwrap();
         let p = path_in(&tmp);
         let first = History::open(&p).unwrap();
-        first.record(&rec("ABC-5", NOW)).unwrap();
-        let e = History::open(&p).err().expect("the file is locked");
+        let second = History::open(&p).unwrap();
+        first.record(&rec("ABC-5", NOW - DAY)).unwrap();
+        second.record(&rec("XYZ-6", NOW)).unwrap();
+        assert_eq!(second.get("ABC-5").unwrap(), Some(rec("ABC-5", NOW - DAY)));
+        assert_eq!(first.get("XYZ-6").unwrap(), Some(rec("XYZ-6", NOW)));
+        assert!(second.update_text("ABC-5", "edited in the second", "body 2").unwrap());
+        let edited = TicketRecord { title: "edited in the second".into(), description: "body 2".into(), ..rec("ABC-5", NOW - DAY) };
+        assert_eq!(first.recent(NOW).unwrap(), vec![rec("XYZ-6", NOW), edited.clone()]);
+        assert_eq!(second.recent(NOW).unwrap(), vec![rec("XYZ-6", NOW), edited]);
+    }
+
+    #[test]
+    fn the_file_is_not_held_between_operations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = path_in(&tmp);
+        let h = History::open(&p).unwrap();
+        h.record(&rec("ABC-3", NOW)).unwrap();
+        // `raw` opens the file itself, which redb refuses while any handle holds it.
+        let stored: TicketRecord = serde_json::from_str(&raw(&p, "ABC-3").expect("stored under the key")).unwrap();
+        assert_eq!(stored, rec("ABC-3", NOW));
+        assert_eq!(h.get("ABC-3").unwrap(), Some(rec("ABC-3", NOW)));
+    }
+
+    #[test]
+    fn path_is_the_one_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("sub dir").join("my tickets.redb");
+        assert_eq!(History::open(&p).unwrap().path(), p.as_path());
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_a_file_fails_at_once_naming_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("tickets.redb");
+        std::fs::create_dir(&p).unwrap();
+        let started = Instant::now();
+        let e = History::open(&p).err().expect("a directory is not a database file");
         assert_eq!(e.to_string(), format!("opening {}", p.display()));
-        drop(first);
-        assert_eq!(History::open(&p).unwrap().get("ABC-5").unwrap(), Some(rec("ABC-5", NOW)));
+        assert!(started.elapsed() < Duration::from_secs(2), "not retried as a held file: {:?}", started.elapsed());
     }
 
     #[test]
@@ -95,6 +141,121 @@ mod open {
         let p = blocker.join("tickets.redb");
         let e = History::open(&p).err().expect("cannot create a dir over a file");
         assert_eq!(e.to_string(), format!("creating {}", blocker.display()));
+    }
+}
+
+/// Another process (or a raw `Database` in this one) holding the file.
+mod held_elsewhere {
+    use super::*;
+
+    type Op = fn(&History, &Path) -> anyhow::Result<String>;
+
+    fn summary(r: Option<TicketRecord>) -> String {
+        r.map_or_else(|| "none".into(), |r| r.title)
+    }
+
+    /// History with ABC-1 created at `NOW`.
+    fn with_abc1(p: &Path) -> History {
+        let h = History::open(p).unwrap();
+        h.record(&rec("ABC-1", NOW)).unwrap();
+        h
+    }
+
+    #[test]
+    fn every_operation_waits_and_succeeds_once_the_file_is_released() {
+        // (name, operation, its result summary)
+        let rows: [(&str, Op, &str); 6] = [
+            ("record", |h, _| {
+                h.record(&rec("XYZ-2", NOW - DAY))?;
+                Ok(h.get("XYZ-2")?.map_or_else(|| "lost".into(), |r| format!("{} {}", r.key, r.created)))
+            }, "XYZ-2 1794225600"),
+            ("get", |h, _| Ok(summary(h.get("ABC-1")?)), "title of ABC-1"),
+            ("recent", |h, _| Ok(keys(&h.recent(NOW)?).join(",")), "ABC-1"),
+            ("update_text", |h, _| Ok(h.update_text("ABC-1", "T2", "D2")?.to_string()), "true"),
+            ("prune", |h, _| Ok(h.prune(NOW + 30 * DAY)?.to_string()), "1"),
+            ("open", |_, p| Ok(summary(History::open(p)?.get("ABC-1")?)), "title of ABC-1"),
+        ];
+        for (name, op, expected) in rows {
+            let tmp = tempfile::tempdir().unwrap();
+            let p = path_in(&tmp);
+            let h = with_abc1(&p);
+            let holder = Database::create(&p).unwrap();
+            let (calling_tx, calling) = std::sync::mpsc::channel();
+            let (result, finished, released, took) = std::thread::scope(|s| {
+                let worker = s.spawn(|| {
+                    calling_tx.send(()).unwrap();
+                    let result = op(&h, &p).map_err(|e| format!("{e:#}"));
+                    (result, Instant::now())
+                });
+                calling.recv().unwrap();
+                let started = Instant::now();
+                std::thread::sleep(Duration::from_millis(300));
+                let released = Instant::now();
+                drop(holder);
+                let (result, finished) = worker.join().unwrap();
+                (result, finished, released, started.elapsed())
+            });
+            assert_eq!(result.as_deref(), Ok(expected), "{name}");
+            // The op cannot have finished while the file was still held.
+            assert!(finished >= released, "{name}: finished {:?} before the release", released - finished);
+            assert!(took >= Duration::from_millis(300), "{name}: result after only {took:?}");
+        }
+    }
+
+    #[test]
+    fn a_write_while_held_past_the_5_s_wait_fails_naming_the_file_and_loses_nothing_earlier() {
+        // Slow by design: the full lock wait of 5 s.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = path_in(&tmp);
+        let h = with_abc1(&p);
+        let holder = Database::create(&p).unwrap();
+        let started = Instant::now();
+        let e = h.record(&rec("XYZ-9", NOW)).expect_err("the file stays held");
+        let took = started.elapsed();
+        drop(holder);
+        assert_eq!(e.to_string(), format!("opening {}", p.display()));
+        assert!(
+            matches!(e.root_cause().downcast_ref::<redb::DatabaseError>(), Some(redb::DatabaseError::DatabaseAlreadyOpen)),
+            "{e:#}"
+        );
+        assert!(took >= Duration::from_secs(5), "gave up after {took:?}");
+        assert_eq!(h.recent(NOW).unwrap(), vec![rec("ABC-1", NOW)]);
+        assert_eq!(h.get("XYZ-9").unwrap(), None);
+    }
+
+    #[test]
+    fn concurrent_records_through_two_handles_are_all_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = path_in(&tmp);
+        let handles = [History::open(&p).unwrap(), History::open(&p).unwrap()];
+        std::thread::scope(|s| {
+            for t in 0..8_i64 {
+                let h = &handles[(t % 2) as usize];
+                s.spawn(move || {
+                    for n in 0..5_i64 {
+                        h.record(&rec(&format!("ABC-{}", t * 10 + n), NOW - (t * 10 + n))).unwrap();
+                    }
+                });
+            }
+        });
+        let expected: Vec<String> = (0..8).flat_map(|t| (0..5).map(move |n| format!("ABC-{}", t * 10 + n))).collect();
+        for h in &handles {
+            // Created NOW - number, so newest first is ascending number.
+            assert_eq!(keys(&h.recent(NOW).unwrap()), expected.iter().map(String::as_str).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn records_from_two_handles_survive_dropping_both_and_reopening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = path_in(&tmp);
+        {
+            let first = History::open(&p).unwrap();
+            let second = History::open(&p).unwrap();
+            first.record(&rec("ABC-1", NOW - DAY)).unwrap();
+            second.record(&rec("XYZ-2", NOW - 2 * DAY)).unwrap();
+        }
+        assert_eq!(History::open(&p).unwrap().recent(NOW).unwrap(), vec![rec("ABC-1", NOW - DAY), rec("XYZ-2", NOW - 2 * DAY)]);
     }
 }
 

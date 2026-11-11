@@ -43,9 +43,22 @@ pub fn ticket_record(key: &str, new: &NewIssue, language: &str, sources: Vec<Wor
     }
 }
 
-pub struct History {
-    db: Database,
+/// The startup log line: how many tickets the history holds and where.
+pub fn startup_line(count: usize, path: &Path) -> String {
+    format!("ticket history: {count} tickets from the last {KEEP_DAYS} days in {}", path.display())
 }
+
+/// The history file. It is opened for each read or write only, never held: redb locks an open
+/// file, and a window holding it for its whole life left a second window (the scheduled one next
+/// to one started by hand) without a history, so the tickets created there were never recorded.
+pub struct History {
+    path: PathBuf,
+    /// One open at a time within this process; other processes are waited for in `with_db`.
+    lock: std::sync::Mutex<()>,
+}
+
+/// How long an operation waits for another process to close the file.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// `WORKLOG_TICKETS` in the environment overrides the file location (tests, portable setups).
 pub fn default_path() -> Option<PathBuf> {
@@ -57,32 +70,62 @@ pub fn default_path() -> Option<PathBuf> {
 
 impl History {
     /// Opens or creates the file. Fails while another process has it open: redb locks it.
+    // Since `with_db` the file is only opened to create the table and closed again right away,
+    // and a file held elsewhere is waited for up to `LOCK_WAIT` before this fails.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        let db = Database::create(path).with_context(|| format!("opening {}", path.display()))?;
+        let h = Self { path: path.to_path_buf(), lock: std::sync::Mutex::new(()) };
         // The table exists from here on, so readers never meet a missing one.
-        let txn = db.begin_write()?;
-        txn.open_table(TICKETS)?;
-        txn.commit()?;
-        Ok(Self { db })
+        h.with_db(|db| {
+            let txn = db.begin_write()?;
+            txn.open_table(TICKETS)?;
+            txn.commit()?;
+            Ok(())
+        })?;
+        Ok(h)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Runs `f` on the file, opened for this call only. While another process has it open, tries
+    /// again for up to `LOCK_WAIT`.
+    fn with_db<T>(&self, f: impl FnOnce(&Database) -> Result<T>) -> Result<T> {
+        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let started = std::time::Instant::now();
+        let db = loop {
+            match Database::create(&self.path) {
+                Ok(db) => break db,
+                Err(redb::DatabaseError::DatabaseAlreadyOpen) if started.elapsed() < LOCK_WAIT => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => return Err(e).with_context(|| format!("opening {}", self.path.display())),
+            }
+        };
+        f(&db)
     }
 
     /// Adds or replaces the record of `r.key`.
     pub fn record(&self, r: &TicketRecord) -> Result<()> {
         let json = serde_json::to_string(r)?;
-        let txn = self.db.begin_write()?;
-        txn.open_table(TICKETS)?.insert(r.key.as_str(), json.as_str())?;
-        txn.commit()?;
-        Ok(())
+        self.with_db(|db| {
+            let txn = db.begin_write()?;
+            txn.open_table(TICKETS)?.insert(r.key.as_str(), json.as_str())?;
+            txn.commit()?;
+            Ok(())
+        })
     }
 
     pub fn get(&self, key: &str) -> Result<Option<TicketRecord>> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(TICKETS)?;
-        let Some(v) = table.get(key)? else { return Ok(None) };
-        Ok(Some(serde_json::from_str(v.value()).with_context(|| format!("record of {key}"))?))
+        self.with_db(|db| {
+            let txn = db.begin_read()?;
+            let table = txn.open_table(TICKETS)?;
+            let Some(v) = table.get(key)? else { return Ok(None) };
+            Ok(Some(serde_json::from_str(v.value()).with_context(|| format!("record of {key}"))?))
+        })
     }
 
     /// The text a save to Jira left the ticket with; false when there is no record of it.
@@ -98,19 +141,22 @@ impl History {
     /// A record that cannot be read is skipped (logged), not an error for the rest.
     pub fn recent(&self, now: i64) -> Result<Vec<TicketRecord>> {
         let cutoff = now - KEEP_DAYS * 24 * 3600;
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(TICKETS)?;
-        let mut out = Vec::new();
-        for entry in table.iter()? {
-            let (k, v) = entry?;
-            match serde_json::from_str::<TicketRecord>(v.value()) {
-                Ok(r) if r.created >= cutoff => out.push(r),
-                Ok(_) => {}
-                Err(e) => log::warn!("ticket history: unreadable record {}: {e}", k.value()),
+        let mut out = self.with_db(|db| {
+            let txn = db.begin_read()?;
+            let table = txn.open_table(TICKETS)?;
+            let mut out = Vec::new();
+            for entry in table.iter()? {
+                let (k, v) = entry?;
+                match serde_json::from_str::<TicketRecord>(v.value()) {
+                    Ok(r) if r.created >= cutoff => out.push(r),
+                    Ok(_) => {}
+                    Err(e) => log::warn!("ticket history: unreadable record {}: {e}", k.value()),
+                }
             }
-        }
+            Ok(out)
+        })?;
         // Stable, over redb's key order: equal times stay ordered by key.
-        out.sort_by(|a, b| b.created.cmp(&a.created));
+        out.sort_by_key(|r| std::cmp::Reverse(r.created));
         Ok(out)
     }
 
@@ -118,21 +164,23 @@ impl History {
     /// many went.
     pub fn prune(&self, now: i64) -> Result<usize> {
         let cutoff = now - KEEP_DAYS * 24 * 3600;
-        let txn = self.db.begin_write()?;
-        let removed = {
-            let mut table = txn.open_table(TICKETS)?;
-            let old: Vec<String> = table
-                .iter()?
-                .filter_map(|e| e.ok())
-                .filter(|(_, v)| serde_json::from_str::<TicketRecord>(v.value()).map_or(true, |r| r.created < cutoff))
-                .map(|(k, _)| k.value().to_owned())
-                .collect();
-            for k in &old {
-                table.remove(k.as_str())?;
-            }
-            old.len()
-        };
-        txn.commit()?;
-        Ok(removed)
+        self.with_db(|db| {
+            let txn = db.begin_write()?;
+            let removed = {
+                let mut table = txn.open_table(TICKETS)?;
+                let old: Vec<String> = table
+                    .iter()?
+                    .filter_map(|e| e.ok())
+                    .filter(|(_, v)| serde_json::from_str::<TicketRecord>(v.value()).map_or(true, |r| r.created < cutoff))
+                    .map(|(k, _)| k.value().to_owned())
+                    .collect();
+                for k in &old {
+                    table.remove(k.as_str())?;
+                }
+                old.len()
+            };
+            txn.commit()?;
+            Ok(removed)
+        })
     }
 }

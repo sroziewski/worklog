@@ -808,3 +808,125 @@ mod redraft {
         }
     }
 }
+
+/// The sentence `steer` appends to every system prompt, copied from the contract.
+const STEER_SYSTEM: &str = " The ticket's author added instructions for this rewrite, given at the end: follow them, also over the style rules above, but never invent facts for them.";
+
+mod steer {
+    use super::*;
+
+    #[test]
+    fn blank_instructions_leave_both_prompts_unchanged() {
+        for blank in ["", " ", "  \n\t \r\n"] {
+            assert_eq!(drafting::steer("SYS-a".into(), "USER-b\n".into(), blank), ("SYS-a".to_owned(), "USER-b\n".to_owned()), "{blank:?}");
+        }
+    }
+
+    #[test]
+    fn instructions_rank_in_the_system_prompt_and_end_the_user_message_trimmed() {
+        // (name, instructions, expected text after "Author's instructions:\n")
+        let rows: [(&str, &str, &str); 4] = [
+            ("plain", "shorter", "shorter"),
+            ("surrounding whitespace trimmed", " \t add a test case for an expired token \n\n", "add a test case for an expired token"),
+            ("multi-line keeps inner lines and their indent", "\n- shorter\n  - mention the admin panel\n\n", "- shorter\n  - mention the admin panel"),
+            ("format characters and diacritics kept as typed", "dodaj „wygasły token” {0} %s \\n", "dodaj „wygasły token” {0} %s \\n"),
+        ];
+        for (name, instructions, kept) in rows {
+            let (system, user) = drafting::steer("System prompt X.".into(), "Jira project: XYZ\nWork items:\n(none)\n".into(), instructions);
+            assert_eq!(system, format!("System prompt X.{STEER_SYSTEM}"), "{name}");
+            assert_eq!(user, format!("Jira project: XYZ\nWork items:\n(none)\n\nAuthor's instructions:\n{kept}\n"), "{name}");
+        }
+    }
+}
+
+mod redraft_with_instructions {
+    use super::*;
+
+    struct Redraft {
+        result: Result<TicketDraft>,
+        calls: Vec<(String, String)>,
+        progress: Vec<(Stage, usize)>,
+    }
+
+    fn redraft(instructions: Option<&str>) -> Redraft {
+        let answers = vec![
+            ok(json!({"tasks": [{"items": [3, 2]}, {"items": [1]}]})),
+            ok(json!({"tickets": [
+                {"task": 1, "title": "Eksport wierszy do CSV", "summary": "Audytorzy nie mogą pobrać wierszy.", "criteria": ["Przycisk pobiera plik CSV"]},
+                {"task": 2, "title": "Drugi tytuł", "summary": "S2.", "criteria": ["C2"]}
+            ]})),
+            ok(json!({"tests": [{"ticket": 1, "cases": ["Tabela z 2 wierszami -> 3 linie"]}]})),
+            ok(json!({"tickets": [{"title": "Pobieranie wierszy jako CSV"}]})),
+        ];
+        let chat = Scripted { answers: RefCell::new(answers.into()), calls: RefCell::new(Vec::new()) };
+        let progress = RefCell::new(Vec::new());
+        let report = |s: Stage| progress.borrow_mut().push((s, chat.calls.borrow().len()));
+        let result = match instructions {
+            Some(i) => drafting::redraft_ticket_with(&chat, "Alpha", "Polish", &current(), &items(), i, &report),
+            None => drafting::redraft_ticket(&chat, "Alpha", "Polish", &current(), &items(), &report),
+        };
+        Redraft { result, calls: chat.calls.into_inner(), progress: progress.into_inner() }
+    }
+
+    /// The four prompts of `redraft` without instructions, built from the public prompt builders.
+    fn plain_calls() -> Vec<(String, String)> {
+        let analysis = json!({"tasks": [{"items": [3, 2]}, {"items": [1]}]});
+        let one = json!({"tickets": [{"title": "Eksport wierszy do CSV", "summary": "Audytorzy nie mogą pobrać wierszy.", "criteria": ["Przycisk pobiera plik CSV"]}]});
+        let tested = json!({"tickets": [{"title": "Eksport wierszy do CSV", "summary": "Audytorzy nie mogą pobrać wierszy.", "criteria": ["Przycisk pobiera plik CSV"], "tests": ["Tabela z 2 wierszami -> 3 linie"]}]});
+        vec![
+            drafting::analyst_prompt_for("Alpha", &items(), Some(&current())),
+            drafting::writer_prompt_for("Alpha", "Polish", &items(), &analysis, Some(&current())),
+            drafting::tester_prompt("Polish", &analysis, &one),
+            drafting::reviewer_prompt("Polish", &items(), &analysis, &tested),
+        ]
+    }
+
+    fn reviewed_draft() -> TicketDraft {
+        draft(
+            "Pobieranie wierszy jako CSV",
+            "h3. Opis\nAudytorzy nie mogą pobrać wierszy.\n\nh3. Kryteria akceptacji\n* Przycisk pobiera plik CSV\n\nh3. Przypadki testowe\n# Tabela z 2 wierszami -> 3 linie",
+            // Task 1 names items 3 and 2: zero-based, in item order.
+            &[1, 2],
+        )
+    }
+
+    #[test]
+    fn every_one_of_the_four_calls_carries_the_trimmed_instructions() {
+        let r = redraft(Some("  add a test case for an expired token\nshorter description \n"));
+        let expected: Vec<(String, String)> = plain_calls()
+            .into_iter()
+            .map(|(s, u)| {
+                (format!("{s}{STEER_SYSTEM}"), format!("{u}\nAuthor's instructions:\nadd a test case for an expired token\nshorter description\n"))
+            })
+            .collect();
+        assert_eq!(r.calls.len(), 4);
+        for (i, (got, want)) in r.calls.iter().zip(&expected).enumerate() {
+            assert_eq!(got, want, "call {i}");
+        }
+        assert_eq!(r.progress, vec![(Stage::Analyst, 0), (Stage::Writer, 1), (Stage::Tester, 2), (Stage::Reviewer, 3)]);
+        assert_eq!(r.result.unwrap(), reviewed_draft());
+    }
+
+    #[test]
+    fn blank_instructions_give_exactly_the_plain_redraft() {
+        let plain = redraft(None);
+        assert_eq!(plain.calls, plain_calls(), "fixture: redraft_ticket sends the plain prompts");
+        for blank in ["", " \n\t "] {
+            let r = redraft(Some(blank));
+            assert_eq!(r.calls, plain_calls(), "{blank:?}");
+            assert_eq!(r.progress, plain.progress, "{blank:?}");
+            assert_eq!(r.result.unwrap(), reviewed_draft(), "{blank:?}");
+        }
+        assert_eq!(plain.result.unwrap(), reviewed_draft());
+    }
+
+    #[test]
+    fn draft_tickets_never_carries_instructions() {
+        let r = run(vec![ok(analysis()), ok(writer()), ok(tester()), ok(json!({"tickets": [{"title": ""}, {"title": ""}]}))]);
+        assert_eq!(r.calls.len(), 4);
+        for (i, (system, user)) in r.calls.iter().enumerate() {
+            assert!(!user.contains("Author's instructions"), "call {i}: {user}");
+            assert!(!system.contains("added instructions"), "call {i}: {system}");
+        }
+    }
+}

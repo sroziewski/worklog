@@ -202,6 +202,98 @@ mod editor {
     }
 }
 
+mod regen_request {
+    use super::*;
+    use worklog::drafting::CurrentTicket;
+
+    fn item(line: &str, change: Option<&str>) -> WorkItem {
+        WorkItem { line: line.into(), change: change.map(str::to_owned) }
+    }
+
+    fn two_diffs() -> Vec<WorkItem> {
+        vec![item("[api] ABC-7 add export", Some("+fn export()")), item("[web] uncommitted a.ts", None), item("[svc] ABC-7 csv header", Some("+header"))]
+    }
+
+    #[test]
+    fn carries_the_fields_as_edited_the_stored_language_the_sources_and_the_instructions_as_typed() {
+        let mut e = Editor::new(details("ABC-7", "Export rows", "h3. Opis\nRows.\n"), two_diffs(), "Polish".into());
+        e.title = "Edited title".into();
+        e.description = "Edited body".into();
+        e.instructions = "  add a test case for an expired token\n".into();
+        assert_eq!(
+            e.regen_request("English", true),
+            (
+                CurrentTicket { key: "ABC-7".into(), title: "Edited title".into(), description: "Edited body".into() },
+                "Polish".to_owned(),
+                two_diffs(),
+                "  add a test case for an expired token\n".to_owned(),
+            )
+        );
+    }
+
+    #[test]
+    fn send_code_off_drops_every_diff_and_keeps_the_lines() {
+        let e = Editor::new(details("ABC-7", "Export rows", "Body"), two_diffs(), "Polish".into());
+        let (_, _, items, _) = e.regen_request("English", false);
+        assert_eq!(items, vec![item("[api] ABC-7 add export", None), item("[web] uncommitted a.ts", None), item("[svc] ABC-7 csv header", None)]);
+    }
+
+    #[test]
+    fn blank_stored_language_falls_back_to_the_default() {
+        // (name, stored language, expected)
+        let rows: [(&str, &str, &str); 4] = [
+            ("stored", "Polish", "Polish"),
+            ("stored, kept as stored", " German ", " German "),
+            ("empty", "", "Esperanto"),
+            ("whitespace", " \t", "Esperanto"),
+        ];
+        for (name, stored, expected) in rows {
+            let e = Editor::new(details("XYZ-3", "T3", "D3"), vec![], stored.into());
+            let (current, language, items, instructions) = e.regen_request("Esperanto", true);
+            assert_eq!(language, expected, "{name}");
+            assert_eq!(current, CurrentTicket { key: "XYZ-3".into(), title: "T3".into(), description: "D3".into() }, "{name}");
+            assert_eq!((items, instructions), (vec![], String::new()), "{name}");
+        }
+    }
+}
+
+mod instructions {
+    use super::*;
+
+    const TYPED: &str = "  add a test case for an expired token\nshorter ";
+
+    #[test]
+    fn start_empty_and_are_not_a_change_to_save() {
+        let mut e = editor();
+        assert_eq!(e.instructions, "");
+        e.instructions = TYPED.into();
+        assert_eq!(e.changes(), (None, None));
+        assert!(!e.is_dirty());
+        assert!(!e.can_save());
+    }
+
+    #[test]
+    fn are_kept_as_typed_by_revert_redraft_and_save_results() {
+        type Step = fn(&mut Editor);
+        // (name, step, expected title after it): the title shows the step really ran.
+        let rows: [(&str, Step, &str); 5] = [
+            ("revert", |e| e.revert(), "Export rows"),
+            ("redraft ok", |e| e.apply_redraft(Ok(TicketDraft { title: "Redrafted".into(), description: "D".into(), items: vec![1] })), "Redrafted"),
+            ("redraft error", |e| e.apply_redraft(Err(anyhow!("LLM 503: overloaded"))), "Typed title"),
+            ("saved", |e| drop(e.apply_saved(Ok(details("ABC-7", "Typed title", "h3. Opis\nRows.\n")))), "Typed title"),
+            ("save error", |e| drop(e.apply_saved(Err(anyhow!("ABC-7 changed in Jira since you opened it")))), "Typed title"),
+        ];
+        for (name, step, title) in rows {
+            let mut e = editor();
+            e.title = "Typed title".into();
+            e.instructions = TYPED.into();
+            step(&mut e);
+            assert_eq!(e.title, title, "{name}");
+            assert_eq!(e.instructions, TYPED, "{name}");
+        }
+    }
+}
+
 mod apply_redraft {
     use super::*;
 

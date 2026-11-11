@@ -70,6 +70,8 @@ pub struct Editor {
     /// What the ticket was created from, and the language it was written in.
     pub sources: Vec<WorkItem>,
     pub language: String,
+    /// The author's instructions for Regenerate; kept after it, to refine and run again.
+    pub instructions: String,
     regenerating: Option<(Receiver<Regen>, Option<Stage>)>,
     saving: Option<Receiver<anyhow::Result<IssueDetails>>>,
 }
@@ -85,6 +87,7 @@ impl Editor {
             notice: None,
             sources,
             language,
+            instructions: String::new(),
             regenerating: None,
             saving: None,
         }
@@ -153,8 +156,18 @@ impl Editor {
         }
     }
 
+    /// What Regenerate sends: the ticket as the fields hold it now, the language (the stored one,
+    /// else `default_language`), the stored sources (diffs dropped when `send_code` is off) and
+    /// the author's instructions.
+    pub fn regen_request(&self, default_language: &str, send_code: bool) -> (CurrentTicket, String, Vec<WorkItem>, String) {
+        let current = CurrentTicket { key: self.loaded.key.clone(), title: self.title.clone(), description: self.description.clone() };
+        let language = if self.language.trim().is_empty() { default_language.to_owned() } else { self.language.clone() };
+        (current, language, regen_items(&self.sources, send_code), self.instructions.clone())
+    }
+
     /// Rewrites the fields with the LLM from what they hold now and the stored sources (their
     /// diffs dropped when `send_code` is off).
+    // What exactly is sent is `regen_request`.
     fn regenerate(&mut self, cfg: &Config) {
         let creds = match llm::credentials(&cfg.tickets, |k| std::env::var(k).ok()) {
             Ok(c) => c,
@@ -165,9 +178,7 @@ impl Editor {
         };
         self.error = None;
         self.notice = None;
-        let current = CurrentTicket { key: self.loaded.key.clone(), title: self.title.clone(), description: self.description.clone() };
-        let language = if self.language.trim().is_empty() { cfg.tickets.language.clone() } else { self.language.clone() };
-        let items = regen_items(&self.sources, cfg.tickets.send_code);
+        let (current, language, items, instructions) = self.regen_request(&cfg.tickets.language, cfg.tickets.send_code);
         log::info!("regenerating {} with {} from {} stored items", current.key, creds.model, items.len());
         let (tx, rx) = channel();
         std::thread::spawn(move || {
@@ -176,7 +187,7 @@ impl Editor {
                 log::info!("regenerating step {}/4: {}", s.number(), s.label());
                 let _ = progress_tx.send(Regen::Stage(s));
             };
-            let res = drafting::redraft_ticket(&Llm::new(creds), project_of(&current.key), &language, &current, &items, &progress);
+            let res = drafting::redraft_ticket_with(&Llm::new(creds), project_of(&current.key), &language, &current, &items, &instructions, &progress);
             if let Err(e) = &res {
                 log::error!("regenerating {}: {e:#}", current.key);
             }
@@ -413,7 +424,8 @@ impl IssueBrowser {
             ui.vertical(|ui| {
                 ui.set_width(330.0);
                 let shown = filter_issues(&self.list, self.project.as_deref(), &self.query);
-                ui.weak(format!("{} of {} tickets created here in the last {KEEP_DAYS} days", shown.len(), self.list.len()));
+                ui.weak(format!("{} of {} tickets created here in the last {KEEP_DAYS} days", shown.len(), self.list.len()))
+                    .on_hover_text(self.history.as_ref().map_or_else(|| "no ticket history".to_owned(), |h| format!("stored in {}", h.path().display())));
                 egui::ScrollArea::vertical().id_salt("my-tickets-list").max_height(520.0).auto_shrink([false, false]).show(ui, |ui| {
                     for i in shown {
                         let text = egui::RichText::new(format!("{}  {}", i.key, i.summary)).size(EVIDENCE_TEXT_SIZE);
@@ -475,6 +487,14 @@ impl IssueBrowser {
         egui::ScrollArea::vertical().id_salt("my-ticket-description").max_height(380.0).show(ui, |ui| {
             ui.add_enabled(editable, egui::TextEdit::multiline(&mut ed.description).desired_rows(16).desired_width(f32::INFINITY).code_editor());
         });
+        ui.label("Instructions for Regenerate (optional)");
+        ui.add_enabled(
+            editable,
+            egui::TextEdit::multiline(&mut ed.instructions)
+                .hint_text("e.g. add a test case for an expired token · shorter description · mention that the admin panel is affected")
+                .desired_rows(2)
+                .desired_width(f32::INFINITY),
+        );
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let regen = ui

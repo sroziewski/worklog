@@ -805,6 +805,42 @@ mod created_targets {
 }
 
 #[test]
+fn needs_starter_row_only_without_activity_rows_and_with_time_left() {
+    // (name, activity rows, budget minutes, expected)
+    let rows: [(&str, usize, u32, bool); 6] = [
+        ("no rows, day full", 0, 0, false),
+        ("no rows, one minute left", 0, 1, true),
+        ("no rows, whole day left", 0, 480, true),
+        ("one row, time left", 1, 480, false),
+        ("rows, day full", 3, 0, false),
+        ("many rows, time left", 7, 1, false),
+    ];
+    for (name, activity_rows, budget, expected) in rows {
+        assert_eq!(flow::needs_starter_row(activity_rows, budget), expected, "{name}");
+    }
+}
+
+#[test]
+fn day_view_activity_whenever_git_rows_exist_full_only_without_rows_and_time() {
+    use worklog::flow::DayView;
+    // (name, activity rows, all rows, unplanned minutes, expected)
+    let rows: [(&str, usize, usize, u32, DayView); 9] = [
+        ("activity with time left", 2, 3, 45, DayView::Activity),
+        ("activity, nothing unplanned", 1, 1, 0, DayView::Activity),
+        ("activity rows only", 4, 4, 480, DayView::Activity),
+        ("no rows, day full", 0, 0, 0, DayView::Full),
+        ("no rows, time left: the starter row was removed", 0, 0, 30, DayView::NoActivity),
+        ("no rows, one minute left", 0, 0, 1, DayView::NoActivity),
+        ("manual rows, time left", 0, 2, 90, DayView::NoActivity),
+        ("manual rows, nothing left", 0, 1, 0, DayView::NoActivity),
+        ("many manual rows, nothing left", 0, 5, 0, DayView::NoActivity),
+    ];
+    for (name, activity_rows, all_rows, unplanned, expected) in rows {
+        assert_eq!(flow::day_view(activity_rows, all_rows, unplanned), expected, "{name}");
+    }
+}
+
+#[test]
 fn decision_after_posting_accepts_only_when_something_was_posted() {
     assert_eq!(flow::decision_after_posting(true), Some(Decision::Accepted));
     assert_eq!(flow::decision_after_posting(false), None);

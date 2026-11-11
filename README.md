@@ -44,6 +44,9 @@ Rust + egui: one native executable, Windows 11 now, the same code builds on Linu
    **+ Add row** (under the table) adds another row while the ticked rows don't fill the
    workday yet: it starts with the hours still missing, you pick a ticket and adjust the hours;
    **×** removes it. Such rows are logged without a comment.
+
+   **A day without git activity** (meetings, reviews, support) opens with one such row holding
+   the hours still to log: pick the ticket from your open tickets, set the hours, Accept.
 5. **Already logged.** Before opening, both `worklog popup` and the scheduled run ask Jira how
    much you logged that day — by hand or through the app; with a full workday (8h,
    `workday_minutes`) there, no window appears and the console/log says why. If Jira can't be
@@ -96,7 +99,10 @@ Click a ticket to load its current title and description from Jira, then:
 
 - edit them by hand, or
 - **✨ Regenerate** — the same four steps (analyst, writer, tester, reviewer) rewrite them from
-  what the fields hold now and the stored lines and diffs. The result only fills the fields;
+  what the fields hold now and the stored lines and diffs. Type your own **instructions** in
+  the field above the button to steer it ("add a test case for an expired token", "shorter
+  description"); they win over the style rules, never over the facts, and stay in the field so
+  you can refine and run again. The result only fills the fields;
 - **↺ Revert** brings back Jira's version;
 - **💾 Save changes** writes the changed fields to Jira. If the ticket was changed in Jira since
   you opened it (in the browser, by someone else), Save refuses instead of overwriting it.
@@ -249,7 +255,7 @@ errors.
 | `%APPDATA%\worklog\state.json` | days answered (Accepted/Denied), last ~3 months; only a Deny keeps the window closed |
 | `%APPDATA%\worklog\worklog.log` | log of every run, CLI and scheduled window, with debug detail (git commands, Jira requests and timings, worklogs posted, Accept/Deny); restarts after 2 MB; never contains the token |
 | `%APPDATA%\worklog\last-error.txt` | why the scheduled window failed to open, if it did |
-| `%APPDATA%\worklog\tickets.redb` | tickets created here in the last 7 days with the lines and diffs they were drafted from (redb database; older ones are removed when the window opens). One window at a time can use it; a second one works without **My tickets** |
+| `%APPDATA%\worklog\tickets.redb` | tickets created here in the last 7 days with the lines and diffs they were drafted from (redb database; older ones are removed when the window opens). Opened only for each read or write, so it is kept from run to run and a second window open at the same time shares it; the log names it and its ticket count at startup |
 
 The environment variables `WORKLOG_LOG`, `WORKLOG_STATE` and `WORKLOG_TICKETS` move the log, state and ticket history files
 elsewhere (portable setups, tests).

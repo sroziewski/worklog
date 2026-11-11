@@ -306,3 +306,32 @@ pub fn apply_updated(report: &mut crate::report::Report, issue: &crate::jira::Is
         i.status = issue.status.clone();
     }
 }
+
+/// A day without git activity starts with one row to pick a ticket for, holding the time still
+/// to log; a day already full gets none.
+pub fn needs_starter_row(activity_rows: usize, budget_minutes: u32) -> bool {
+    activity_rows == 0 && budget_minutes > 0
+}
+
+/// What the main panel shows below the header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DayView {
+    /// Rows from git activity.
+    Activity,
+    /// No git activity: the rows added by hand, if any, and "+ Add row" to add (more).
+    NoActivity,
+    /// No rows and no time left to log: nothing to do.
+    Full,
+}
+
+/// `activity_rows` of `rows` come from git; `unplanned_minutes` is the time no ticked row covers.
+/// Removing every row by hand on a day with time left must still leave "+ Add row" reachable.
+pub fn day_view(activity_rows: usize, rows: usize, unplanned_minutes: u32) -> DayView {
+    if activity_rows > 0 {
+        DayView::Activity
+    } else if rows == 0 && unplanned_minutes == 0 {
+        DayView::Full
+    } else {
+        DayView::NoActivity
+    }
+}

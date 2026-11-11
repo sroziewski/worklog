@@ -198,6 +198,49 @@ mod load {
     }
 
     #[test]
+    fn a_day_without_git_activity_has_no_rows_the_whole_day_left_and_the_open_tickets_listed() {
+        // Either a repo with commits only on the days around 2026-11-04, or no repo at all.
+        for quiet_repo in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            if quiet_repo {
+                let alpha = root.join("alpha");
+                init_repo(&alpha, &local_at(day(2026, 11, 1), 8, 0, 0));
+                commit(&alpha, &local_at(day(2026, 11, 3), 17, 0, 0), "ABC-1 the day before", "");
+                commit(&alpha, &local_at(day(2026, 11, 5), 9, 0, 0), "ABC-1 the day after", "");
+            }
+            let (scanned, warnings) = if quiet_repo { (1, vec![]) } else { (0, vec![format!("no git repos found under {:?}", vec![root.clone()])]) };
+            let mock = jira(200);
+            let cfg = Config { workday_minutes: 450, ..cfg(&root) };
+
+            let (r, heard) = run(&cfg, &mock);
+
+            let (report, projects) = r.unwrap();
+            let name = if quiet_repo { "repo without commits on the day" } else { "no repos" };
+            assert_eq!(report.rows.len(), 0, "{name}");
+            assert_eq!((report.already_logged_minutes, report.budget_minutes), (0, 450), "{name}");
+            assert!(worklog::flow::needs_starter_row(report.rows.len(), report.budget_minutes), "{name}");
+            assert_eq!(report.candidates, vec![abc50()], "{name}");
+            assert_eq!(candidate_searches(&mock), 1, "{name}");
+            assert_eq!(report.warnings, warnings, "{name}");
+            assert_eq!(
+                steps(&heard),
+                vec![
+                    step("asking Jira who you are"),
+                    Progress::Scanning(scanned),
+                    step("reading what you logged on 2026-11-04"),
+                    step("looking up 0 tickets in Jira"),
+                    step("listing your open tickets"),
+                    step("reading project names"),
+                ],
+                "{name}"
+            );
+            assert_eq!(projects, named_projects(), "{name}");
+        }
+    }
+
+    #[test]
     fn a_failed_open_ticket_list_leaves_it_empty_and_loading_goes_on() {
         let tmp = tempfile::tempdir().unwrap();
         let mock = jira(500);

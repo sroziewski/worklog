@@ -55,6 +55,15 @@ mod find_all {
     }
 
     #[test]
+    fn no_configured_project_matches_nothing() {
+        let m = matcher(&[]);
+        for text in ["-12", "fix -12", "ABC-12 api", "feat/_12", "x_7 and -8,-9", ""] {
+            assert_eq!(m.find_all(text), Vec::<String>::new(), "{text:?}");
+            assert_eq!(m.first(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
     fn lower_case_configuration_matches_and_uppercases() {
         assert_eq!(matcher(&["abc"]).find_all("feat/abc-3"), vec!["ABC-3".to_string()]);
     }

@@ -794,3 +794,164 @@ fn build_without_repos_warns_and_has_no_activity() {
     assert_eq!(r.candidates, vec![]);
     assert!(r.repo_paths.is_empty(), "{:?}", r.repo_paths);
 }
+
+/// Projects switched off in the Projects window (`Config::apply_projects`).
+mod disabled_projects {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use worklog::projects::Project;
+
+    fn project(name: &str, git_dir: &Path, jira_key: &str, enabled: bool) -> Project {
+        Project { name: name.into(), git_dir: git_dir.display().to_string(), jira_key: jira_key.into(), enabled }
+    }
+
+    /// `root/api` with `api` commits and `root/legacy` (itself a repo) with `legacy` commits, as
+    /// `(subject, hour, minute)` on D.
+    fn tree(tmp: &tempfile::TempDir, api: &[(&str, u32, u32)], legacy: &[(&str, u32, u32)]) -> (PathBuf, PathBuf, PathBuf) {
+        let d = day(D.0, D.1, D.2);
+        let setup = local_at(day(2026, 11, 1), 8, 0, 0);
+        let root = tmp.path().join("root");
+        let (api_repo, legacy_repo) = (root.join("api"), root.join("legacy"));
+        for (repo, commits) in [(&api_repo, api), (&legacy_repo, legacy)] {
+            init_repo(repo, &setup);
+            commit(repo, &setup, "init", "");
+            for (subject, h, m) in commits {
+                commit(repo, &local_at(d, *h, *m, 0), subject, "");
+            }
+        }
+        (root, api_repo, legacy_repo)
+    }
+
+    fn cfg(list: &[Project]) -> Config {
+        let mut c = Config { author_emails: vec![common::ME.into()], ctx_env_file: None, jira_url: None, ..Config::default() };
+        c.apply_projects(list);
+        c
+    }
+
+    fn build(cfg: &Config, mock: &MockJira) -> report::Report {
+        common::empty_git_config();
+        let d = day(D.0, D.1, D.2);
+        report::build_at(cfg, &Jira::new(&mock.base, "tok"), d, day(2026, 11, 10), None).unwrap()
+    }
+
+    /// (bucket, evidence) per row, sorted by bucket: the row order is the planner's business.
+    fn sorted_rows(r: &report::Report) -> Vec<(Bucket, Vec<String>)> {
+        let mut rows = evidence_rows(r);
+        rows.sort();
+        rows
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn repos_under_a_disabled_folder_are_not_scanned_even_inside_an_enabled_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, api, legacy) = tree(&tmp, &[("ABC-1 api", 10, 0)], &[("ABC-2 legacy fix", 10, 30), ("plain legacy", 11, 0)]);
+        let c = cfg(&[project("Root", &root, "ABC", true), project("Legacy", &legacy, "LEG", false)]);
+        let r = build(&c, &mock_all_known());
+        assert_eq!(sorted_rows(&r), vec![(Bucket::Issue("ABC-1".into()), strings(&["ABC-1 api"]))]);
+        assert_eq!(r.repo_paths, BTreeMap::from([("api".to_string(), vec![api])]));
+        assert_eq!(r.warnings, Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_same_tree_with_the_nested_project_enabled_scans_both() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, api, legacy) = tree(&tmp, &[("ABC-1 api", 10, 0)], &[("ABC-2 legacy fix", 10, 30), ("plain legacy", 11, 0)]);
+        let c = cfg(&[project("Root", &root, "ABC", true), project("Legacy", &legacy, "LEG", true)]);
+        let r = build(&c, &mock_all_known());
+        assert_eq!(
+            sorted_rows(&r),
+            vec![
+                (Bucket::Issue("ABC-1".into()), strings(&["ABC-1 api"])),
+                (Bucket::Issue("ABC-2".into()), strings(&["ABC-2 legacy fix"])),
+                (Bucket::Unassigned("legacy".into()), strings(&["plain legacy"])),
+            ]
+        );
+        assert_eq!(r.repo_paths, BTreeMap::from([("api".to_string(), vec![api]), ("legacy".to_string(), vec![legacy])]));
+    }
+
+    #[test]
+    fn commits_of_a_key_only_disabled_projects_use_are_dropped_not_left_without_a_ticket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let commits = [("ABC-1 api", 10, 0), ("XYZ-5 old work", 10, 30), ("cleanup", 11, 0), ("xyz_6 more old work", 11, 30)];
+        let (root, _, _) = tree(&tmp, &commits, &[]);
+        let c = cfg(&[project("Root", &root, "ABC", true), project("Beta", Path::new(""), "XYZ", false)]);
+        let mock = mock_all_known();
+        let r = build(&c, &mock);
+        assert_eq!(
+            sorted_rows(&r),
+            vec![(Bucket::Issue("ABC-1".into()), strings(&["ABC-1 api"])), (Bucket::Unassigned("api".into()), strings(&["cleanup"]))]
+        );
+        // Nor is a dropped key looked up in Jira.
+        let looked_up: Vec<String> = mock.requests().iter().map(|x| path_of(&x.url).to_owned()).filter(|p| p.starts_with("/rest/api/2/issue/")).collect();
+        assert_eq!(looked_up, vec!["/rest/api/2/issue/ABC-1".to_string()]);
+        // The open tickets for the unassigned row come from the enabled project only.
+        let open_ticket_searches: Vec<String> = mock
+            .requests()
+            .iter()
+            .filter_map(|x| query_param(&x.url, "jql"))
+            .filter(|q| !q.starts_with("worklogAuthor"))
+            .collect();
+        assert_eq!(open_ticket_searches, vec![r#"assignee = currentUser() AND resolution = Unresolved AND project in ("ABC") ORDER BY updated DESC"#.to_string()]);
+    }
+
+    #[test]
+    fn an_enabled_folder_whose_only_repo_is_disabled_gives_no_missing_repos_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let setup = local_at(day(2026, 11, 1), 8, 0, 0);
+        let root = tmp.path().join("root");
+        let legacy = root.join("legacy");
+        init_repo(&legacy, &setup);
+        commit(&legacy, &setup, "init", "");
+        commit(&legacy, &local_at(day(D.0, D.1, D.2), 10, 0, 0), "ABC-2 legacy fix", "");
+        let c = cfg(&[project("Root", &root, "ABC", true), project("Legacy", &legacy, "LEG", false)]);
+        let r = build(&c, &mock_all_known());
+        // Repos were found, all of them disabled: nothing is missing, so no warning.
+        assert_eq!(r.warnings, Vec::<String>::new());
+        assert_eq!(evidence_rows(&r), vec![]);
+        assert_eq!(r.repo_paths, BTreeMap::new());
+    }
+
+    #[test]
+    fn a_key_an_enabled_project_shares_with_a_disabled_one_stays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, _, _) = tree(&tmp, &[("ABC-1 api", 10, 0), ("XYZ-5 old work", 10, 30), ("cleanup", 11, 0)], &[]);
+        let elsewhere = tmp.path().join("elsewhere");
+        let c = cfg(&[
+            project("Root", &root, "ABC", true),
+            project("Beta", Path::new(""), "XYZ", true),
+            project("Beta old", &elsewhere, "XYZ", false),
+        ]);
+        let r = build(&c, &mock_all_known());
+        assert_eq!(
+            sorted_rows(&r),
+            vec![
+                (Bucket::Issue("ABC-1".into()), strings(&["ABC-1 api"])),
+                (Bucket::Issue("XYZ-5".into()), strings(&["XYZ-5 old work"])),
+                (Bucket::Unassigned("api".into()), strings(&["cleanup"])),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_project_disabled_builds_an_empty_report_without_asking_for_open_tickets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, _, legacy) = tree(&tmp, &[("ABC-1 api", 10, 0), ("cleanup", 11, 0)], &[("XYZ-2 legacy", 12, 0)]);
+        let c = cfg(&[project("Root", &root, "ABC", false), project("Legacy", &legacy, "XYZ", false), project("Meetings", Path::new(""), "MEET", false)]);
+        let mock = mock_all_known();
+        let r = build(&c, &mock);
+        assert_eq!(evidence_rows(&r), vec![]);
+        assert_eq!(r.warnings, Vec::<String>::new());
+        assert_eq!(r.candidates, vec![]);
+        assert_eq!(r.repo_paths, BTreeMap::new());
+        assert_eq!(r.budget_minutes, 480);
+        let reqs = mock.requests();
+        let paths: Vec<&str> = reqs.iter().map(|x| path_of(&x.url)).collect();
+        assert_eq!(paths, vec!["/rest/api/2/myself", "/rest/api/2/search"]);
+        assert_eq!(query_param(&reqs[1].url, "jql").as_deref(), Some(r#"worklogAuthor = currentUser() AND worklogDate = "2026-11-04""#));
+    }
+}

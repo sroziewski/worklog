@@ -35,6 +35,18 @@ pub struct Config {
     pub jira_url: Option<String>,
     /// Creating tickets from the app (`[tickets]` in the file).
     pub tickets: TicketConfig,
+    /// The Projects window's list (`projects.toml`) when there is one; `apply_projects` derived
+    /// the three fields above from its enabled entries.
+    #[serde(skip)]
+    pub projects: Option<Vec<crate::projects::Project>>,
+    /// Keys only disabled projects use: still recognised in commits, so their work is dropped
+    /// rather than suggested as work without a ticket.
+    #[serde(skip)]
+    pub inactive_keys: Vec<String>,
+    /// Folders of disabled projects; repos under them are not scanned even inside an enabled
+    /// project's folder.
+    #[serde(skip)]
+    pub inactive_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -90,6 +102,9 @@ impl Default for Config {
             ctx_env_file: dirs::config_dir().map(|d| d.join("agents-context").join(".env")),
             jira_url: None,
             tickets: TicketConfig::default(),
+            projects: None,
+            inactive_keys: Vec::new(),
+            inactive_roots: Vec::new(),
         }
     }
 }
@@ -119,7 +134,11 @@ impl Config {
             None => String::new(),
         };
         let what = path.as_ref().map_or_else(|| "the settings".to_owned(), |p| p.display().to_string());
-        Self::parse_with(&text, &local).with_context(|| format!("parsing {what}"))
+        let projects = match crate::projects::default_path() {
+            Some(p) => crate::projects::load(&p)?,
+            None => None,
+        };
+        Self::parse_full(&text, &local, projects.as_deref()).with_context(|| format!("parsing {what}"))
     }
 
     pub fn parse(text: &str) -> Result<Self> {
@@ -131,6 +150,13 @@ impl Config {
     /// `WORKLOG_REPO_PROJECTS` ("root=KEY;root=KEY"), `JIRA_URL`, `WORKLOG_LLM_PROVIDER`,
     /// `WORKLOG_LLM_MODEL`, `WORKLOG_TICKET_FIELDS` (a JSON object). Blank values count as unset.
     pub fn parse_with(text: &str, local: &[(String, String)]) -> Result<Self> {
+        Self::parse_full(text, local, None)
+    }
+
+    /// `parse_with`, then `projects` (the Projects window's list, already validated) replacing
+    /// whatever the file and `.env` set for repos and projects. With such a list, having no
+    /// enabled project is valid: the app must still start so the window can enable one.
+    pub fn parse_full(text: &str, local: &[(String, String)], projects: Option<&[crate::projects::Project]>) -> Result<Self> {
         let mut cfg: Self = toml::from_str(text)?;
         let file = toml::from_str::<toml::Table>(text)?;
         let tickets = file.get("tickets").and_then(toml::Value::as_table);
@@ -165,6 +191,9 @@ impl Config {
         if let Some(v) = get("WORKLOG_TICKET_FIELDS").filter(|_| !in_tickets("fields")) {
             cfg.tickets.fields = serde_json::from_str(v).context("WORKLOG_TICKET_FIELDS must be a JSON object")?;
         }
+        if let Some(list) = projects {
+            cfg.apply_projects(list);
+        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -175,7 +204,7 @@ impl Config {
         if self.round_minutes == 0 {
             bail!("round_minutes must be at least 1");
         }
-        if self.project_keys.is_empty() {
+        if self.project_keys.is_empty() && self.projects.is_none() {
             bail!("no Jira projects: set WORKLOG_PROJECT_KEYS in .env (see .env.example) or project_keys in config.toml");
         }
         let mut roots: Vec<Vec<String>> = Vec::new();
@@ -209,6 +238,47 @@ impl Config {
             })
     }
 
+    /// Makes `list` the projects: its enabled entries become `repo_roots`, `project_keys` (in list
+    /// order, each once) and `repo_projects`; the rest only `inactive_keys` / `inactive_roots`.
+    /// `list` must have passed `projects::validate`.
+    pub fn apply_projects(&mut self, list: &[crate::projects::Project]) {
+        let (on, off): (Vec<_>, Vec<_>) = list.iter().partition(|p| p.enabled);
+        self.repo_roots = on.iter().filter(|p| !p.git_dir.is_empty()).map(|p| PathBuf::from(&p.git_dir)).collect();
+        self.project_keys = Vec::new();
+        for p in &on {
+            if !self.project_keys.iter().any(|k| k.eq_ignore_ascii_case(&p.jira_key)) {
+                self.project_keys.push(p.jira_key.clone());
+            }
+        }
+        self.repo_projects = on.iter().filter(|p| !p.git_dir.is_empty()).map(|p| (p.git_dir.clone(), p.jira_key.clone())).collect();
+        self.inactive_keys = Vec::new();
+        for p in &off {
+            let used = self.project_keys.iter().chain(&self.inactive_keys).any(|k| k.eq_ignore_ascii_case(&p.jira_key));
+            if !used {
+                self.inactive_keys.push(p.jira_key.clone());
+            }
+        }
+        self.inactive_roots = off.iter().filter(|p| !p.git_dir.is_empty()).map(|p| PathBuf::from(&p.git_dir)).collect();
+        self.projects = Some(list.to_vec());
+    }
+
+    /// False when the deepest configured folder holding `repo` belongs to a disabled project.
+    pub fn repo_active(&self, repo: &Path) -> bool {
+        let repo = path_key(repo);
+        let deepest = |roots: &[PathBuf]| roots.iter().map(|r| path_key(r)).filter(|r| !r.is_empty() && repo.starts_with(r)).map(|r| r.len()).max();
+        match (deepest(&self.repo_roots), deepest(&self.inactive_roots)) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(on), Some(off)) => on > off,
+        }
+    }
+
+    /// False for an issue key (`ABC-12`) of a project only disabled projects use.
+    pub fn key_active(&self, issue_key: &str) -> bool {
+        let project = crate::jira::project_of(issue_key);
+        !self.inactive_keys.iter().any(|k| k.eq_ignore_ascii_case(project))
+    }
+
     pub fn day_start_time(&self) -> Result<NaiveTime> {
         parse_hhmm(&self.day_start).context("day_start")
     }
@@ -232,7 +302,7 @@ pub fn local_env_path() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
-fn path_key(p: &Path) -> Vec<String> {
+pub(crate) fn path_key(p: &Path) -> Vec<String> {
     p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect()
 }
 

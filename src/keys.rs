@@ -8,6 +8,10 @@ pub struct KeyMatcher {
 impl KeyMatcher {
     pub fn new(project_keys: &[String]) -> Self {
         let alts: Vec<String> = project_keys.iter().map(|k| regex::escape(&k.to_uppercase())).collect();
+        // No keys would leave an empty group matching a bare "-12"; this never matches.
+        if alts.is_empty() {
+            return Self { re: Regex::new(r"[^\s\S]").expect("valid regex") };
+        }
         // Branch names spell keys in lower case and sometimes with '_' (feat/hd_1439); the
         // lookarounds regex lacks are replaced by explicit non-alphanumeric boundaries.
         let pattern = format!(r"(?i)(?:^|[^A-Za-z0-9])({})[-_](\d+)(?:$|[^0-9])", alts.join("|"));

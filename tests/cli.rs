@@ -24,6 +24,9 @@ struct Sandbox {
     /// An empty `.env` as WORKLOG_ENV, so the binary never finds the repository's own `.env`
     /// next to `target/`.
     local_env: PathBuf,
+    /// WORKLOG_PROJECTS: no file unless a test writes one, so the binary never reads the real
+    /// Projects list.
+    projects: PathBuf,
 }
 
 impl Sandbox {
@@ -43,7 +46,14 @@ impl Sandbox {
         .unwrap();
         let local_env = p.join("local.env");
         std::fs::write(&local_env, "").unwrap();
-        Self { config: config.to_str().unwrap().to_owned(), log: p.join("logs").join("worklog.log"), state: p.join("state.json"), local_env, _dir: dir }
+        Self {
+            config: config.to_str().unwrap().to_owned(),
+            log: p.join("logs").join("worklog.log"),
+            state: p.join("state.json"),
+            local_env,
+            projects: p.join("projects.toml"),
+            _dir: dir,
+        }
     }
 
     /// Runs the binary; kills it after 30 s so a window that opened by mistake cannot hang the
@@ -56,6 +66,7 @@ impl Sandbox {
             .env("WORKLOG_LOG", &self.log)
             .env("WORKLOG_STATE", &self.state)
             .env("WORKLOG_ENV", &self.local_env)
+            .env("WORKLOG_PROJECTS", &self.projects)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -331,6 +342,32 @@ mod runs {
         let (code, stdout, stderr) = sb.run(&["popup", "--date", "2025-03-11", "--config", &sb.config], &mock.base);
         assert_eq!(code, Some(0), "{stderr}");
         assert_eq!(stdout, "2025-03-11: not opening — you denied this day; use --force to ask again\n");
+    }
+
+    #[test]
+    fn the_projects_list_worklog_projects_names_replaces_the_configured_keys() {
+        let sb = Sandbox::new();
+        std::fs::write(&sb.projects, "[[project]]\nname = \"Quality\"\njira_key = \"qqq\"\n[[project]]\nname = \"Alpha\"\njira_key = \"ABC\"\nenabled = false\n").unwrap();
+        let jira = dead_jira();
+        let (code, stdout, stderr) = sb.run(&["--config", &sb.config, "config"], &jira.base);
+        assert_eq!(code, Some(0), "{stderr}");
+        // `config` prints the settings with `{:#?}`; the file's ABC and XYZ are gone.
+        assert!(stdout.contains("\n    project_keys: [\n        \"QQQ\",\n    ],\n"), "{stdout}");
+        assert!(stdout.contains("\n    inactive_keys: [\n        \"ABC\",\n    ],\n"), "{stdout}");
+        assert_eq!(jira.requests().len(), 0);
+    }
+
+    #[test]
+    fn an_invalid_projects_list_stops_the_run_naming_the_file() {
+        let sb = Sandbox::new();
+        std::fs::write(&sb.projects, "[[project]]\nname = \"  \"\njira_key = \"ABC\"\n").unwrap();
+        let jira = dead_jira();
+        let (code, stdout, stderr) = sb.run(&["--config", &sb.config, "config"], &jira.base);
+        assert_eq!(code, Some(1), "{stderr}");
+        assert_eq!(stdout, "");
+        let expected = format!("Error: checking {}\n\nCaused by:\n    project 1: the name is empty\n", sb.projects.display());
+        assert!(stderr.ends_with(&expected), "{stderr}");
+        assert_eq!(jira.requests().len(), 0);
     }
 
     #[test]

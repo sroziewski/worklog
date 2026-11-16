@@ -168,6 +168,10 @@ impl Jira {
     /// Open issues assigned to me in the given projects, most recently updated first: the
     /// choices offered for activity that names no ticket.
     pub fn candidates(&self, project_keys: &[String], max_results: u32) -> Result<Vec<Issue>> {
+        // `project in ()` is a JQL error; no projects simply means no tickets.
+        if project_keys.is_empty() {
+            return Ok(Vec::new());
+        }
         let projects = project_keys.iter().map(|k| format!("\"{k}\"")).collect::<Vec<_>>().join(", ");
         self.search(
             &format!("assignee = currentUser() AND resolution = Unresolved AND project in ({projects}) ORDER BY updated DESC"),

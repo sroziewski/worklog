@@ -199,6 +199,9 @@ mod parse {
                     llm_url: Some("https://llm.example.test/v1".into()),
                     send_code: false,
                 },
+                projects: None,
+                inactive_keys: vec![],
+                inactive_roots: vec![],
             }
         );
     }
@@ -616,6 +619,214 @@ mod parse_with {
         let toml = "project_keys = [\"ABC\"]\nround_minutes = 10\n";
         assert_eq!(Config::parse(toml).unwrap(), parse(toml, &[]).unwrap());
         assert_eq!(chain(&Config::parse("").unwrap_err()), chain(&parse("", &[]).unwrap_err()));
+    }
+}
+
+fn project(name: &str, git_dir: &str, jira_key: &str, enabled: bool) -> worklog::projects::Project {
+    worklog::projects::Project { name: name.into(), git_dir: git_dir.into(), jira_key: jira_key.into(), enabled }
+}
+
+fn paths(v: &[&str]) -> Vec<PathBuf> {
+    v.iter().map(PathBuf::from).collect()
+}
+
+fn strings(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+/// `Config::apply_projects`: the Projects list turned into the repo and project settings.
+mod apply_projects {
+    use super::*;
+
+    #[test]
+    fn enabled_projects_become_the_settings_and_disabled_ones_the_inactive_lists() {
+        let list = vec![
+            project("Alpha", r"D:\dev\alpha", "ABC", true),
+            project("Beta", r"D:\dev\beta", "XYZ", false),
+            project("Meetings", "", "MEET", true),
+            project("Alpha tools", r"D:\dev\alpha\tools", "QQQ", false),
+            // A disabled project sharing a key with an enabled one, in another case.
+            project("Alpha legacy", r"E:\old\alpha", "abc", false),
+            // An enabled key repeated in another case: listed once, as first spelled.
+            project("Alpha web", r"E:\src\web", "Abc", true),
+            project("Beta notes", "", "xyz", false),
+            project("Archive", "", "ZZZ", false),
+        ];
+        let mut c = Config { ctx_env_file: None, ..Config::default() };
+        c.apply_projects(&list);
+        assert_eq!(c.repo_roots, paths(&[r"D:\dev\alpha", r"E:\src\web"]));
+        assert_eq!(c.project_keys, strings(&["ABC", "MEET"]));
+        assert_eq!(c.repo_projects, BTreeMap::from([(r"D:\dev\alpha".to_string(), "ABC".to_string()), (r"E:\src\web".to_string(), "Abc".to_string())]));
+        assert_eq!(c.inactive_keys, strings(&["XYZ", "QQQ", "ZZZ"]));
+        assert_eq!(c.inactive_roots, paths(&[r"D:\dev\beta", r"D:\dev\alpha\tools", r"E:\old\alpha"]));
+        assert_eq!(c.projects, Some(list));
+    }
+
+    #[test]
+    fn replaces_what_was_set_before() {
+        let mut c = Config {
+            repo_roots: paths(&[r"C:\old\root"]),
+            project_keys: strings(&["OLD"]),
+            repo_projects: BTreeMap::from([(r"C:\old\root".to_string(), "OLD".to_string())]),
+            ctx_env_file: None,
+            ..Config::default()
+        };
+        c.apply_projects(&[project("Beta", r"D:\dev\beta", "XYZ", false), project("Gone", "", "GON", false)]);
+        let second = vec![project("Alpha", r"D:\dev\alpha", "ABC", true)];
+        c.apply_projects(&second);
+        assert_eq!(c.repo_roots, paths(&[r"D:\dev\alpha"]));
+        assert_eq!(c.project_keys, strings(&["ABC"]));
+        assert_eq!(c.repo_projects, BTreeMap::from([(r"D:\dev\alpha".to_string(), "ABC".to_string())]));
+        assert_eq!(c.inactive_keys, Vec::<String>::new());
+        assert_eq!(c.inactive_roots, Vec::<PathBuf>::new());
+        assert_eq!(c.projects, Some(second));
+    }
+
+    #[test]
+    fn every_project_disabled_leaves_no_settings() {
+        let list = vec![project("Alpha", r"D:\dev\alpha", "ABC", false), project("Meetings", "", "MEET", false)];
+        let mut c = Config { project_keys: strings(&["OLD"]), ctx_env_file: None, ..Config::default() };
+        c.apply_projects(&list);
+        assert_eq!((c.repo_roots.len(), c.project_keys.len(), c.repo_projects.len()), (0, 0, 0));
+        assert_eq!(c.inactive_keys, strings(&["ABC", "MEET"]));
+        assert_eq!(c.inactive_roots, paths(&[r"D:\dev\alpha"]));
+    }
+}
+
+/// `Config::parse_full`: the Projects list over `config.toml` and `.env`.
+mod parse_full {
+    use super::*;
+
+    fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn the_list_replaces_the_file_and_env_repo_and_project_settings() {
+        let toml = "round_minutes = 20\nrepo_roots = ['C:\\file\\root']\nproject_keys = [\"FIL\"]\n[repo_projects]\n'C:\\file\\root' = \"FIL\"\n";
+        let local = env(&[("JIRA_URL", "https://jira.example.org"), ("WORKLOG_LLM_MODEL", "env-model")]);
+        let list = vec![project("Alpha", r"D:\dev\alpha", "ABC", true), project("Beta", r"E:\src\beta", "XYZ", false), project("Meetings", "", "MEET", true)];
+        let c = Config::parse_full(toml, &local, Some(&list)).unwrap();
+        assert_eq!(c.repo_roots, paths(&[r"D:\dev\alpha"]));
+        assert_eq!(c.project_keys, strings(&["ABC", "MEET"]));
+        assert_eq!(c.repo_projects, BTreeMap::from([(r"D:\dev\alpha".to_string(), "ABC".to_string())]));
+        assert_eq!(c.inactive_keys, strings(&["XYZ"]));
+        assert_eq!(c.inactive_roots, paths(&[r"E:\src\beta"]));
+        assert_eq!(c.projects, Some(list));
+        // The other settings still come from the file and the .env.
+        assert_eq!((c.round_minutes, c.jira_url.as_deref(), c.tickets.llm_model.as_str()), (20, Some("https://jira.example.org"), "env-model"));
+    }
+
+    #[test]
+    fn the_list_replaces_env_only_settings_too() {
+        let local = env(&[("WORKLOG_REPO_ROOTS", r"C:\env\root"), ("WORKLOG_PROJECT_KEYS", "ENV"), ("WORKLOG_REPO_PROJECTS", r"C:\env\root=ENV")]);
+        let list = vec![project("Alpha", r"D:\dev\alpha", "ABC", true)];
+        let c = Config::parse_full("", &local, Some(&list)).unwrap();
+        assert_eq!(c.repo_roots, paths(&[r"D:\dev\alpha"]));
+        assert_eq!(c.project_keys, strings(&["ABC"]));
+        assert_eq!(c.repo_projects, BTreeMap::from([(r"D:\dev\alpha".to_string(), "ABC".to_string())]));
+    }
+
+    #[test]
+    fn every_project_disabled_is_a_valid_config_without_projects() {
+        let list = vec![project("Alpha", r"D:\dev\alpha", "ABC", false)];
+        let c = Config::parse_full("", &[], Some(&list)).unwrap();
+        assert_eq!(c.project_keys, Vec::<String>::new());
+        assert_eq!(c.repo_roots, Vec::<PathBuf>::new());
+        assert_eq!(c.inactive_keys, strings(&["ABC"]));
+        assert_eq!(c.projects, Some(list));
+    }
+
+    #[test]
+    fn the_rest_of_the_config_is_still_validated() {
+        let list = vec![project("Alpha", r"D:\dev\alpha", "ABC", true)];
+        let e = Config::parse_full("round_minutes = 0\n", &[], Some(&list)).unwrap_err();
+        assert_eq!(chain(&e), vec!["round_minutes must be at least 1".to_string()]);
+    }
+
+    #[test]
+    fn without_a_list_it_is_parse_with() {
+        let toml = "project_keys = [\"ABC\"]\nround_minutes = 10\n";
+        let local = env(&[("WORKLOG_REPO_ROOTS", r"D:\dev\alpha")]);
+        let c = Config::parse_full(toml, &local, None).unwrap();
+        assert_eq!(c, Config::parse_with(toml, &local).unwrap());
+        assert_eq!((c.projects, c.inactive_keys.len(), c.inactive_roots.len()), (None, 0, 0));
+        assert_eq!(c.repo_roots, paths(&[r"D:\dev\alpha"]));
+        // Without a list, no project at all is still an error.
+        assert_eq!(chain(&Config::parse_full("", &[], None).unwrap_err()), vec![NO_PROJECTS.to_string()]);
+    }
+}
+
+/// `Config::repo_active` and `Config::key_active`: what a disabled project switches off.
+mod active {
+    use super::*;
+
+    fn cfg() -> Config {
+        let mut c = Config { ctx_env_file: None, ..Config::default() };
+        c.apply_projects(&[
+            project("Dev", r"D:\dev", "DEV", true),
+            project("Old", r"D:\dev\old", "OLD", false),
+            project("Old keep", r"D:\dev\old\keep", "KEP", true),
+            project("Off", r"E:\off", "XYZ", false),
+            project("Shared off", r"F:\shared", "DEV", false),
+            project("Notes", "", "QQQ", false),
+        ]);
+        c
+    }
+
+    #[test]
+    fn a_repo_is_inactive_when_its_deepest_configured_folder_is_disabled() {
+        let c = cfg();
+        // (case, repo, active)
+        let rows = [
+            ("under an enabled folder only", r"D:\dev\api", true),
+            ("under a disabled folder nested in an enabled one", r"D:\dev\old\svc", false),
+            ("the disabled folder itself", r"D:\dev\old", false),
+            ("another case", r"d:\DEV\Old\svc", false),
+            ("trailing separator", "D:\\dev\\old\\svc\\", false),
+            ("an enabled folder nested in a disabled one", r"D:\dev\old\keep\web", true),
+            ("under a disabled folder only", r"E:\off\tool", false),
+            ("a disabled folder whose key an enabled project uses", r"F:\shared\x", false),
+            ("a name that only starts like a disabled folder", r"D:\dev\older\svc", true),
+            ("under no configured folder", r"G:\other\repo", true),
+        ];
+        for (case, repo, active) in rows {
+            assert_eq!(c.repo_active(Path::new(repo)), active, "{case}: {repo}");
+        }
+    }
+
+    #[test]
+    fn without_disabled_projects_every_repo_is_active() {
+        let c = Config { repo_roots: paths(&[r"D:\dev"]), project_keys: strings(&["DEV"]), ctx_env_file: None, ..Config::default() };
+        for repo in [r"D:\dev\api", r"E:\x\y"] {
+            assert!(c.repo_active(Path::new(repo)), "{repo}");
+        }
+    }
+
+    #[test]
+    fn a_key_is_inactive_only_when_only_disabled_projects_use_it() {
+        let c = cfg();
+        // (issue key, active)
+        let rows = [
+            ("XYZ-12", false),
+            ("xyz-3", false),
+            ("QQQ-7", false),
+            ("OLD-1", false),
+            ("DEV-40", true),
+            ("KEP-2", true),
+            ("XY-12", true),
+            ("XYZQ-1", true),
+            ("ABC-5", true),
+        ];
+        for (key, active) in rows {
+            assert_eq!(c.key_active(key), active, "{key}");
+        }
+    }
+
+    #[test]
+    fn without_disabled_projects_every_key_is_active() {
+        let c = Config { project_keys: strings(&["ABC"]), ctx_env_file: None, ..Config::default() };
+        assert!(c.key_active("XYZ-1") && c.key_active("ABC-2"));
     }
 }
 

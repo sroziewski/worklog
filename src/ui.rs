@@ -14,6 +14,7 @@ use crate::report::{self, Report, Row, fmt_minutes};
 use crate::state::{Decision, State};
 use crate::history::History;
 use crate::ui_issues::{BrowserOutcome, IssueBrowser};
+use crate::ui_projects::ProjectsEditor;
 use crate::ui_tickets::{CodeSource, Creator, EVIDENCE_TEXT_SIZE, Outcome, WorkGroup};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -82,6 +83,9 @@ pub struct WorklogApp {
     /// The "My tickets" window; kept while closed, so unsaved edits survive reopening it.
     browser: Option<IssueBrowser>,
     browser_open: bool,
+    /// The "Projects" window; kept while closed, so unsaved edits survive reopening it.
+    projects_editor: Option<ProjectsEditor>,
+    projects_open: bool,
     row_ids: flow::RowIds,
 }
 
@@ -183,23 +187,13 @@ pub fn run(cfg: Config, creds: JiraCredentials, date: NaiveDate, state_path: Opt
 
 impl WorklogApp {
     fn new(cfg: Config, creds: JiraCredentials, date: NaiveDate, state_path: Option<PathBuf>) -> Self {
-        let (tx, rx) = channel();
-        let (ptx, prx) = channel();
-        let (c, cr) = (cfg.clone(), creds.clone());
-        std::thread::spawn(move || {
-            let jira = Jira::new(&cr.url, &cr.token);
-            let progress = |p: report::Progress| {
-                let _ = ptx.send(p);
-            };
-            let today = chrono::Local::now().date_naive();
-            let _ = tx.send(load(&c, &jira, date, today, crate::git::global_user_email(), &progress));
-        });
+        let phase = start_loading(&cfg, &creds, date);
         Self {
             cfg,
             creds,
             state_path,
             date,
-            phase: Phase::Loading(rx, prx, report::LoadProgress::default()),
+            phase,
             report: None,
             rows: Vec::new(),
             projects: Vec::new(),
@@ -207,7 +201,44 @@ impl WorklogApp {
             history: open_history().inspect_err(|e| log::warn!("ticket history: {e}")),
             browser: None,
             browser_open: false,
+            projects_editor: None,
+            projects_open: false,
             row_ids: flow::RowIds::default(),
+        }
+    }
+
+    /// Builds the day again under the current `cfg`, after the projects changed. Rows already
+    /// logged come back as time already logged; an idle New ticket window goes, as its project
+    /// may have been disabled.
+    fn reload(&mut self) {
+        log::info!("projects changed: reloading {}", self.date);
+        self.report = None;
+        self.rows.clear();
+        self.projects.clear();
+        if !self.creator.as_ref().is_some_and(Creator::busy) {
+            self.creator = None;
+        }
+        self.phase = start_loading(&self.cfg, &self.creds, self.date);
+    }
+
+    /// Saving projects reloads the day, which would drop rows being posted or a ticket being
+    /// created for one.
+    fn can_reload(&self) -> bool {
+        flow::can_reload(matches!(self.phase, Phase::Posting(..)), self.creator.as_ref().is_some_and(Creator::busy))
+    }
+
+    fn projects_ui(&mut self, ctx: &egui::Context) {
+        if !self.projects_open {
+            return;
+        }
+        let can_save = self.can_reload();
+        let cfg = &self.cfg;
+        let editor = self.projects_editor.get_or_insert_with(|| ProjectsEditor::new(cfg, crate::projects::default_path()));
+        let (open, saved) = editor.show(ctx, can_save);
+        self.projects_open = open;
+        if let Some(list) = saved {
+            self.cfg.apply_projects(&list);
+            self.reload();
         }
     }
 
@@ -307,7 +338,7 @@ impl WorklogApp {
             drain_progress(prx, progress);
         }
         match &mut self.phase {
-            Phase::Loading(rx, _, _) => match rx.try_recv() {
+            Phase::Loading(rx, ..) => match rx.try_recv() {
                 Ok(Ok((report, projects))) => {
                     let ids = &mut self.row_ids;
                     self.rows = report
@@ -365,11 +396,13 @@ impl WorklogApp {
             if add.clicked() {
                 self.add_row();
             }
-            if new_ticket_button(ui, editable && !busy)
+            let project = self.default_project();
+            if new_ticket_button(ui, editable && !busy && project.is_some())
                 .on_hover_text("create Jira tickets from today's commits and files, proposed by the LLM")
                 .clicked()
+                && let Some(p) = project
             {
-                new_ticket = Some((self.default_project(), None));
+                new_ticket = Some((p, None));
             }
         });
         if let Some((project, row)) = new_ticket {
@@ -425,8 +458,9 @@ impl WorklogApp {
 
     /// The project a New ticket window opened without a row starts in: the first configured one
     /// (the window lets the user switch).
-    fn default_project(&self) -> String {
-        self.projects.first().map_or_else(|| self.cfg.project_keys[0].clone(), |(k, _)| k.clone())
+    // `None` when no project is enabled: there is nothing to create a ticket in.
+    fn default_project(&self) -> Option<String> {
+        flow::default_project(&self.projects, &self.cfg.project_keys)
     }
 
     fn grid_ui(&mut self, ui: &mut egui::Ui, editable: bool, remove: &mut Option<usize>, new_ticket: &mut Option<(String, Option<usize>)>) {
@@ -481,12 +515,13 @@ impl WorklogApp {
                         })
                         .response
                         .on_hover_text(if st.manual { "added by hand".to_owned() } else { format!("activity in {repo} names no ticket") });
-                        if new_ticket_button(ui, editable && !done && !busy)
+                        let project = st.filter.clone().or_else(|| default_project.clone());
+                        if new_ticket_button(ui, editable && !done && !busy && project.is_some())
                             .on_hover_text("no fitting ticket? draft one from this row's commits and files and create it in Jira")
                             .clicked()
+                            && let Some(p) = project
                         {
-                            let project = st.filter.clone().unwrap_or_else(|| default_project.clone());
-                            *new_ticket = Some((project, Some(i)));
+                            *new_ticket = Some((p, Some(i)));
                         }
                         });
                     }
@@ -598,6 +633,12 @@ impl eframe::App for WorklogApp {
                     Phase::Loading(_, _, progress) => {
                         ui.spinner();
                         ui.label(progress.label());
+                        // The header with the button only shows once the day is loaded.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if projects_button(ui).clicked() {
+                                self.projects_open = true;
+                            }
+                        });
                     }
                     Phase::Posting(_, n) => {
                         ui.spinner();
@@ -617,15 +658,23 @@ impl eframe::App for WorklogApp {
             if let Phase::Failed(e) = &self.phase {
                 ui.heading("Could not prepare suggestions");
                 ui.label(e);
+                ui.add_space(8.0);
+                if projects_button(ui).clicked() {
+                    self.projects_open = true;
+                }
                 return;
             }
             let Some(report) = &self.report else { return };
             let mut open_new = false;
+            let has_project = self.default_project().is_some();
             ui.horizontal(|ui| {
                 ui.heading(format!("Work log suggestions for {}", report.date));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if projects_button(ui).clicked() {
+                        self.projects_open = true;
+                    }
                     let busy = self.creator.as_ref().is_some_and(Creator::busy);
-                    open_new = new_ticket_button(ui, matches!(self.phase, Phase::Ready) && !busy)
+                    open_new = new_ticket_button(ui, matches!(self.phase, Phase::Ready) && !busy && has_project)
                         .on_hover_text("create Jira tickets from today's commits and files, proposed by the LLM")
                         .clicked();
                     let mine = ui
@@ -639,8 +688,7 @@ impl eframe::App for WorklogApp {
                     }
                 });
             });
-            if open_new {
-                let project = self.default_project();
+            if open_new && let Some(project) = self.default_project() {
                 self.open_creator(project, None);
             }
             let Some(report) = &self.report else { return };
@@ -651,6 +699,9 @@ impl eframe::App for WorklogApp {
                 fmt_minutes(report.budget_minutes)
             ));
             for w in &report.warnings {
+                ui.colored_label(egui::Color32::from_rgb(190, 130, 20), format!("⚠ {w}"));
+            }
+            if let Some(w) = flow::no_project_warning(&self.cfg.project_keys) {
                 ui.colored_label(egui::Color32::from_rgb(190, 130, 20), format!("⚠ {w}"));
             }
             ui.separator();
@@ -671,6 +722,7 @@ impl eframe::App for WorklogApp {
 
         self.creator_ui(&ctx);
         self.browser_ui(&ctx);
+        self.projects_ui(&ctx);
     }
 }
 
@@ -730,5 +782,26 @@ impl WorklogApp {
 
 fn new_ticket_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
     ui.add_enabled(enabled, egui::Button::new(egui::RichText::new("➕ New ticket…").strong()))
-        .on_disabled_hover_text("not now: data is loading, worklogs are posting, or the New ticket window is busy")
+        .on_disabled_hover_text("not now: data is loading, worklogs are posting, the New ticket window is busy, or no project is enabled")
+}
+
+fn projects_button(ui: &mut egui::Ui) -> egui::Response {
+    ui.button(egui::RichText::new("⚙ Projects").strong())
+        .on_hover_text("the projects suggestions come from: name, git folder, Jira key; add, remove, disable")
+}
+
+/// Starts building the day's report on a thread.
+fn start_loading(cfg: &Config, creds: &JiraCredentials, date: NaiveDate) -> Phase {
+    let (tx, rx) = channel();
+    let (ptx, prx) = channel();
+    let (c, cr) = (cfg.clone(), creds.clone());
+    std::thread::spawn(move || {
+        let jira = Jira::new(&cr.url, &cr.token);
+        let progress = |p: report::Progress| {
+            let _ = ptx.send(p);
+        };
+        let today = chrono::Local::now().date_naive();
+        let _ = tx.send(load(&c, &jira, date, today, crate::git::global_user_email(), &progress));
+    });
+    Phase::Loading(rx, prx, report::LoadProgress::default())
 }

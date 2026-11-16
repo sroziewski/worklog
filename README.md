@@ -116,6 +116,27 @@ all, lock files and similar left out. The model endpoint and key come from openc
 (`~/.config/opencode/opencode.json`, the provider named by `WORKLOG_LLM_PROVIDER`); override with the environment variables
 `LLM_URL`, `LLM_API_KEY`, `LLM_MODEL`, or the `[tickets]` config section below.
 
+## Projects
+
+**⚙ Projects** (top right of the window, also shown when loading failed) lists the projects
+suggestions come from. Each has a **name**, a **git folder** (a repo, or a folder holding repos
+one or two levels down; may be empty for a Jira-only project such as meetings) and a **Jira
+key**, and is **on** or off. **+ Add project** adds one, **×** removes one, **↺ Revert** drops
+unsaved edits, and **💾 Save** writes the list and reloads the day.
+
+Only enabled projects are read and suggested: a disabled project's folders are not scanned (also
+when they sit inside an enabled project's folder), commits naming its tickets are left out, and
+its tickets are not offered in the pickers or in **➕ New ticket**. A key an enabled project also
+uses stays active. With every project disabled the window still opens, so you can enable one.
+
+Save refuses a project without a name or with a malformed key, and a folder listed twice; a
+folder that does not exist (a drive not mounted today) only gets a ⚠. Save waits while worklogs
+are being posted or a ticket is being created.
+
+The list is kept in `projects.toml` and, once saved, replaces `WORKLOG_REPO_ROOTS`,
+`WORKLOG_PROJECT_KEYS` and `WORKLOG_REPO_PROJECTS` (and their `config.toml` keys). Before the
+first save the window starts from those settings, so saving without edits keeps your setup.
+
 ## Install
 
 Requires `git` on `PATH` and Rust (to build).
@@ -252,6 +273,7 @@ errors.
 | Path | Content |
 |---|---|
 | `%APPDATA%\worklog\config.toml` | your settings (optional) |
+| `%APPDATA%\worklog\projects.toml` | the **⚙ Projects** list, once saved; replaces the repo and project settings of `.env` and `config.toml`. `WORKLOG_PROJECTS` in the environment points elsewhere |
 | `%APPDATA%\worklog\state.json` | days answered (Accepted/Denied), last ~3 months; only a Deny keeps the window closed |
 | `%APPDATA%\worklog\worklog.log` | log of every run, CLI and scheduled window, with debug detail (git commands, Jira requests and timings, worklogs posted, Accept/Deny); restarts after 2 MB; never contains the token |
 | `%APPDATA%\worklog\last-error.txt` | why the scheduled window failed to open, if it did |

@@ -739,6 +739,40 @@ mod discover {
         assert_eq!(found, vec![roots.join("a"), roots.join("group").join("b"), roots.join("wt"), solo]);
     }
 
+    /// Paths compared as Windows does: component by component, ignoring case.
+    fn folded(p: &Path) -> Vec<String> {
+        p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect()
+    }
+
+    #[test]
+    fn one_repo_reached_through_differently_spelled_roots_is_listed_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = at(before(3), 8, 0, 0);
+        let root = tmp.path().join("root");
+        init_repo(&root.join("alpha"), &t);
+        init_repo(&root.join("beta"), &t);
+        // The folder of both repos in another case, one repo directly, the other with a
+        // trailing separator and in upper case (the file system ignores case).
+        let roots = [tmp.path().join("Root"), root.join("alpha"), tmp.path().join("ROOT").join("beta").join("")];
+
+        let found = git::discover_repos(&roots);
+
+        // Which spelling survives is not part of the contract; each repo is there once.
+        let found: Vec<Vec<String>> = found.iter().map(|p| folded(p)).collect();
+        assert_eq!(found, vec![folded(&root.join("alpha")), folded(&root.join("beta"))]);
+    }
+
+    #[test]
+    fn repos_are_sorted_ignoring_case() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = at(before(3), 8, 0, 0);
+        let root = tmp.path().join("root");
+        for name in ["Bravo", "alpha", "charlie"] {
+            init_repo(&root.join(name), &t);
+        }
+        assert_eq!(git::discover_repos(&[root.clone()]), vec![root.join("alpha"), root.join("Bravo"), root.join("charlie")]);
+    }
+
     #[test]
     fn no_roots_no_repos() {
         assert_eq!(git::discover_repos(&[]), Vec::<PathBuf>::new());

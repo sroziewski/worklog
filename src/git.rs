@@ -80,8 +80,9 @@ pub fn discover_repos(roots: &[PathBuf]) -> Vec<PathBuf> {
             }
         }
     }
-    out.sort();
-    out.dedup();
+    out.sort_by_cached_key(|p| (crate::config::path_key(p), p.clone()));
+    // One repo reached through two spellings of a root (`D:\dev` and `d:/Dev/alpha`) once.
+    out.dedup_by(|a, b| crate::config::path_key(a) == crate::config::path_key(b));
     out
 }
 

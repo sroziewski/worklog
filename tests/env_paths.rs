@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use worklog::{history, logging, state};
+use worklog::{history, logging, projects, state};
 
 fn set(name: &str, value: Option<&str>) {
     // SAFETY: the only test in this binary; no other thread reads or writes the environment.
@@ -20,10 +20,11 @@ fn env_var_overrides_the_config_dir_default_unless_unset_or_empty() {
     let config_dir = dirs::config_dir().expect("config dir");
     // (variable, function, default file name, override)
     type Row = (&'static str, fn() -> Option<PathBuf>, &'static str, &'static str);
-    let rows: [Row; 3] = [
+    let rows: [Row; 4] = [
         ("WORKLOG_LOG", logging::default_path, "worklog.log", r"C:\sandbox\logs\run-7.log"),
         ("WORKLOG_STATE", state::default_path, "state.json", r"D:\elsewhere\answers-3.json"),
         ("WORKLOG_TICKETS", history::default_path, "tickets.redb", r"E:\portable\my-tickets-9.redb"),
+        ("WORKLOG_PROJECTS", projects::default_path, "projects.toml", r"F:\portable\team-projects-4.toml"),
     ];
     for (var, default_path, file, custom) in rows {
         let fallback = Some(config_dir.join("worklog").join(file));
@@ -38,9 +39,15 @@ fn env_var_overrides_the_config_dir_default_unless_unset_or_empty() {
     set("WORKLOG_LOG", Some(r"C:\only\the.log"));
     assert_eq!(state::default_path(), Some(config_dir.join("worklog").join("state.json")));
     assert_eq!(history::default_path(), Some(config_dir.join("worklog").join("tickets.redb")));
+    assert_eq!(projects::default_path(), Some(config_dir.join("worklog").join("projects.toml")));
     set("WORKLOG_LOG", None);
     set("WORKLOG_TICKETS", Some(r"E:\only\tickets-2.redb"));
     assert_eq!(logging::default_path(), Some(config_dir.join("worklog").join("worklog.log")));
     assert_eq!(state::default_path(), Some(config_dir.join("worklog").join("state.json")));
+    assert_eq!(projects::default_path(), Some(config_dir.join("worklog").join("projects.toml")));
     set("WORKLOG_TICKETS", None);
+    set("WORKLOG_PROJECTS", Some(r"F:\only\projects-5.toml"));
+    assert_eq!(logging::default_path(), Some(config_dir.join("worklog").join("worklog.log")));
+    assert_eq!(history::default_path(), Some(config_dir.join("worklog").join("tickets.redb")));
+    set("WORKLOG_PROJECTS", None);
 }

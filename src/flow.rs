@@ -335,3 +335,21 @@ pub fn day_view(activity_rows: usize, rows: usize, unplanned_minutes: u32) -> Da
         DayView::NoActivity
     }
 }
+
+/// Whether saving the projects may reload the day now. Not while worklogs are posting (the
+/// reload would drop the rows their results land in) or a ticket is being created for a row.
+pub fn can_reload(posting: bool, creator_busy: bool) -> bool {
+    !posting && !creator_busy
+}
+
+/// The project a New ticket window opened without a row starts in: the first of the picker's
+/// `projects`, else the first enabled key; `None` when no project is enabled.
+pub fn default_project(projects: &[(String, String)], project_keys: &[String]) -> Option<String> {
+    projects.first().map(|(k, _)| k.clone()).or_else(|| project_keys.first().cloned())
+}
+
+/// The warning shown above the rows when no project is enabled.
+pub fn no_project_warning(project_keys: &[String]) -> Option<&'static str> {
+    project_keys.is_empty().then_some("No project is enabled: nothing is read or suggested. Enable one in ⚙ Projects.")
+}
+

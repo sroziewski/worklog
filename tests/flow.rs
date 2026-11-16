@@ -845,3 +845,54 @@ fn decision_after_posting_accepts_only_when_something_was_posted() {
     assert_eq!(flow::decision_after_posting(true), Some(Decision::Accepted));
     assert_eq!(flow::decision_after_posting(false), None);
 }
+
+/// The main window around the Projects list: when a save may reload the day, where a New ticket
+/// window starts, and the warning with no project enabled.
+mod projects_in_the_window {
+    use super::*;
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn picker(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter().map(|(k, l)| (k.to_string(), l.to_string())).collect()
+    }
+
+    #[test]
+    fn reload_only_while_neither_posting_nor_creating_a_ticket() {
+        // (posting, creator busy, can reload)
+        let rows = [(false, false, true), (true, false, false), (false, true, false), (true, true, false)];
+        for (posting, busy, expected) in rows {
+            assert_eq!(flow::can_reload(posting, busy), expected, "posting {posting}, creator busy {busy}");
+        }
+    }
+
+    #[test]
+    fn default_project_is_the_first_picker_project_else_the_first_key_else_none() {
+        // (case, picker projects, enabled keys, expected)
+        let rows: [(&str, Vec<(String, String)>, Vec<String>, Option<&str>); 5] = [
+            ("picker first, not the first key", picker(&[("XYZ", "Xylophone (XYZ)"), ("ABC", "Alpha (ABC)")]), strings(&["ABC", "XYZ"]), Some("XYZ")),
+            ("picker without keys", picker(&[("QQQ", "QQQ")]), strings(&[]), Some("QQQ")),
+            ("no picker yet: the first key", picker(&[]), strings(&["MEET", "ABC"]), Some("MEET")),
+            ("one key", picker(&[]), strings(&["ABC"]), Some("ABC")),
+            ("no project enabled", picker(&[]), strings(&[]), None),
+        ];
+        for (case, projects, keys, expected) in rows {
+            assert_eq!(flow::default_project(&projects, &keys).as_deref(), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn warning_only_when_no_project_is_enabled() {
+        // (keys, expected)
+        let rows: [(Vec<String>, Option<&str>); 3] = [
+            (strings(&[]), Some("No project is enabled: nothing is read or suggested. Enable one in ⚙ Projects.")),
+            (strings(&["ABC"]), None),
+            (strings(&["ABC", "XYZ"]), None),
+        ];
+        for (keys, expected) in rows {
+            assert_eq!(flow::no_project_warning(&keys), expected, "{keys:?}");
+        }
+    }
+}

@@ -27,6 +27,9 @@ const NO_PROJECTS: &str = "no Jira projects: set WORKLOG_PROJECT_KEYS in .env (s
 #[test]
 fn worklog_env_names_the_local_settings_that_load_merges_under_the_file() {
     let tmp = tempfile::tempdir().unwrap();
+    // `load` also reads the Projects list; a missing one keeps the real one out and the settings
+    // below in charge (`tests/projects_env.rs` covers a list that is there).
+    set("WORKLOG_PROJECTS", Some(&tmp.path().join("no-projects.toml")));
     let env_file = tmp.path().join("my settings.env");
     std::fs::write(
         &env_file,
@@ -93,4 +96,5 @@ fn worklog_env_names_the_local_settings_that_load_merges_under_the_file() {
     assert_eq!(chain(&e)[0], format!("reading {}", missing.display()));
 
     set("WORKLOG_ENV", None);
+    set("WORKLOG_PROJECTS", None);
 }

@@ -8,10 +8,12 @@ pub mod keys;
 pub mod llm;
 pub mod logging;
 pub mod plan;
+pub mod projects;
 pub mod report;
 pub mod schedule;
 pub mod state;
 pub mod ui;
 pub mod ui_issues;
+pub mod ui_projects;
 pub mod ui_tickets;
 

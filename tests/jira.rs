@@ -228,6 +228,14 @@ mod requests {
         );
         assert_eq!(query_param(url, "maxResults").as_deref(), Some("30"));
     }
+
+    #[test]
+    fn candidates_without_projects_is_empty_without_asking_jira() {
+        // A Jira that would answer with a ticket, so a request would show in the result too.
+        let mock = MockJira::start(|_, _, _| ok(json!({"issues": [{"key": "ABC-1", "fields": {"summary": "One", "status": {"name": "Open"}}}]})));
+        assert_eq!(Jira::new(&mock.base, TOKEN).candidates(&[], 30).unwrap(), vec![]);
+        assert_eq!(mock.requests().len(), 0);
+    }
 }
 
 mod logged_on {

@@ -141,10 +141,18 @@ pub fn build_at_with(
         warnings.push("no author email configured and git user.email is unset; no commits can be matched".into());
     }
 
-    let matcher = KeyMatcher::new(&cfg.project_keys);
+    // Disabled projects' keys too, so their commits are recognised and dropped below instead of
+    // landing in their repo's "no ticket" row.
+    let all_keys: Vec<String> = cfg.project_keys.iter().chain(&cfg.inactive_keys).cloned().collect();
+    let matcher = KeyMatcher::new(&all_keys);
     let collector = Collector { matcher: &matcher, author_emails: &emails, date, include_uncommitted: date == today };
-    let repos = git::discover_repos(&cfg.repo_roots);
-    if repos.is_empty() {
+    let mut repos = git::discover_repos(&cfg.repo_roots);
+    let before = repos.len();
+    repos.retain(|r| cfg.repo_active(r));
+    if repos.len() < before {
+        log::info!("{} repos skipped: they belong to disabled projects", before - repos.len());
+    }
+    if before == 0 && !cfg.repo_roots.is_empty() {
         warnings.push(format!("no git repos found under {:?}", cfg.repo_roots));
     }
     let repo_projects = repo_projects(cfg, &repos);
@@ -157,8 +165,13 @@ pub fn build_at_with(
     log::info!("scanning {} repos under {:?} (uncommitted files: {})", repos.len(), cfg.repo_roots, date == today);
     let t = std::time::Instant::now();
     progress(Progress::Scanning(repos.len()));
-    let (events, errors) = collector.collect_with(&repos, &|e| progress(Progress::Scan(e)));
+    let (mut events, errors) = collector.collect_with(&repos, &|e| progress(Progress::Scan(e)));
     log::info!("git: {} events in {:.2}s", events.len(), t.elapsed().as_secs_f64());
+    let before = events.len();
+    events.retain(|e| e.key.as_deref().is_none_or(|k| cfg.key_active(k)));
+    if events.len() < before {
+        log::info!("{} events dropped: their tickets belong to disabled projects", before - events.len());
+    }
     for e in &errors {
         log::warn!("{e}");
     }

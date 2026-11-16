@@ -261,6 +261,41 @@ mod load {
         assert_eq!(heard, vec![step("asking Jira who you are")]);
         assert_eq!(mock.requests().len(), 1);
     }
+
+    #[test]
+    fn every_project_disabled_loads_an_empty_day_without_asking_for_tickets_or_project_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = repo(&tmp, true);
+        let mut cfg = cfg(&root);
+        cfg.apply_projects(&[
+            worklog::projects::Project { name: "Root".into(), git_dir: root.display().to_string(), jira_key: "ABC".into(), enabled: false },
+            worklog::projects::Project { name: "Xylophone".into(), git_dir: String::new(), jira_key: "XYZ".into(), enabled: false },
+        ]);
+        let mock = jira(200);
+
+        let (r, heard) = run(&cfg, &mock);
+
+        let (report, projects) = r.unwrap();
+        assert_eq!(report.rows.len(), 0);
+        assert_eq!(report.candidates, vec![]);
+        assert_eq!(report.warnings, Vec::<String>::new());
+        assert_eq!(projects, ui::Projects::new());
+        let reqs = mock.requests();
+        let paths: Vec<&str> = reqs.iter().map(|x| x.url.split('?').next().unwrap()).collect();
+        assert_eq!(paths, vec!["/rest/api/2/myself", "/rest/api/2/search"]);
+        assert_eq!(query_param(&reqs[1].url, "jql").as_deref(), Some(r#"worklogAuthor = currentUser() AND worklogDate = "2026-11-04""#));
+        assert_eq!(
+            steps(&heard),
+            vec![
+                step("asking Jira who you are"),
+                Progress::Scanning(0),
+                step("reading what you logged on 2026-11-04"),
+                step("looking up 0 tickets in Jira"),
+                step("listing your open tickets"),
+                step("reading project names"),
+            ]
+        );
+    }
 }
 
 mod drain_progress {

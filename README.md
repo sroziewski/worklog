@@ -116,10 +116,14 @@ all, lock files and similar left out. The model endpoint and key come from openc
 (`~/.config/opencode/opencode.json`, the provider named by `WORKLOG_LLM_PROVIDER`); override with the environment variables
 `LLM_URL`, `LLM_API_KEY`, `LLM_MODEL`, or the `[tickets]` config section below.
 
-## Projects
+## Settings
 
-**⚙ Projects** (top right of the window, also shown when loading failed) lists the projects
-suggestions come from. Each has a **name**, a **git folder** (a repo, or a folder holding repos
+**⚙ Settings** (top right of the window, also shown while loading and when loading failed)
+holds two sections: **Projects** and **Window**.
+
+### Projects
+
+The **Projects** section lists the projects suggestions come from. Each has a **name**, a **git folder** (a repo, or a folder holding repos
 one or two levels down; may be empty for a Jira-only project such as meetings) and a **Jira
 key**, and is **on** or off. **+ Add project** adds one, **×** removes one, **↺ Revert** drops
 unsaved edits, and **💾 Save** writes the list and reloads the day.
@@ -136,6 +140,12 @@ are being posted or a ticket is being created.
 The list is kept in `projects.toml` and, once saved, replaces `WORKLOG_REPO_ROOTS`,
 `WORKLOG_PROJECT_KEYS` and `WORKLOG_REPO_PROJECTS` (and their `config.toml` keys). Before the
 first save the window starts from those settings, so saving without edits keeps your setup.
+
+### Window
+
+**Always on top** keeps the window above the others (on by default, so the 17:00 prompt is not
+lost behind them). Ticking or unticking applies at once, without the Projects **💾 Save**, and
+is remembered in `ui.toml` for the next start, scheduled or `popup --force`.
 
 ## Install
 
@@ -273,7 +283,8 @@ errors.
 | Path | Content |
 |---|---|
 | `%APPDATA%\worklog\config.toml` | your settings (optional) |
-| `%APPDATA%\worklog\projects.toml` | the **⚙ Projects** list, once saved; replaces the repo and project settings of `.env` and `config.toml`. `WORKLOG_PROJECTS` in the environment points elsewhere |
+| `%APPDATA%\worklog\ui.toml` | the **⚙ Settings** window options (always on top); a broken file only falls back to the defaults. `WORKLOG_UI` in the environment points elsewhere |
+| `%APPDATA%\worklog\projects.toml` | the **⚙ Settings** projects list, once saved; replaces the repo and project settings of `.env` and `config.toml`. `WORKLOG_PROJECTS` in the environment points elsewhere |
 | `%APPDATA%\worklog\state.json` | days answered (Accepted/Denied), last ~3 months; only a Deny keeps the window closed |
 | `%APPDATA%\worklog\worklog.log` | log of every run, CLI and scheduled window, with debug detail (git commands, Jira requests and timings, worklogs posted, Accept/Deny); restarts after 2 MB; never contains the token |
 | `%APPDATA%\worklog\last-error.txt` | why the scheduled window failed to open, if it did |

@@ -887,7 +887,7 @@ mod projects_in_the_window {
     fn warning_only_when_no_project_is_enabled() {
         // (keys, expected)
         let rows: [(Vec<String>, Option<&str>); 3] = [
-            (strings(&[]), Some("No project is enabled: nothing is read or suggested. Enable one in ⚙ Projects.")),
+            (strings(&[]), Some("No project is enabled: nothing is read or suggested. Enable one in ⚙ Settings.")),
             (strings(&["ABC"]), None),
             (strings(&["ABC", "XYZ"]), None),
         ];

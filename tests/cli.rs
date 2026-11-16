@@ -27,6 +27,9 @@ struct Sandbox {
     /// WORKLOG_PROJECTS: no file unless a test writes one, so the binary never reads the real
     /// Projects list.
     projects: PathBuf,
+    /// WORKLOG_UI: no file, so a run that opens the window never reads or writes the real
+    /// window settings.
+    ui: PathBuf,
 }
 
 impl Sandbox {
@@ -52,6 +55,7 @@ impl Sandbox {
             state: p.join("state.json"),
             local_env,
             projects: p.join("projects.toml"),
+            ui: p.join("ui.toml"),
             _dir: dir,
         }
     }
@@ -67,6 +71,7 @@ impl Sandbox {
             .env("WORKLOG_STATE", &self.state)
             .env("WORKLOG_ENV", &self.local_env)
             .env("WORKLOG_PROJECTS", &self.projects)
+            .env("WORKLOG_UI", &self.ui)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

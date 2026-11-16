@@ -89,69 +89,78 @@ impl ProjectsEditor {
         let mut open = true;
         let mut saved = None;
         egui::Window::new("Projects").open(&mut open).default_width(720.0).resizable(true).show(ctx, |ui| {
-            ui.label("Suggestions come from the enabled projects only: their git folders are read, and their tickets offered.");
-            ui.add_space(6.0);
-            let mut remove = None;
-            egui::Grid::new("projects").striped(true).num_columns(5).spacing([10.0, 6.0]).show(ui, |ui| {
-                ui.strong("On");
-                ui.strong("Name");
-                ui.strong("Git folder");
-                ui.strong("Jira key");
-                ui.strong("");
-                ui.end_row();
-                for (i, p) in self.rows.iter_mut().enumerate() {
-                    ui.checkbox(&mut p.enabled, "").on_hover_text("off: not read, its tickets not suggested; kept for later");
-                    ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(140.0).hint_text("name"));
-                    ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut p.git_dir).desired_width(300.0).hint_text("repo, or folder of repos (optional)"));
-                        let dir = p.git_dir.trim();
-                        if !dir.is_empty() && !std::path::Path::new(dir).is_dir() {
-                            ui.colored_label(egui::Color32::from_rgb(190, 130, 20), "⚠").on_hover_text("folder not found");
-                        }
-                    });
-                    ui.add(egui::TextEdit::singleline(&mut p.jira_key).desired_width(80.0).hint_text("KEY"));
-                    if ui.small_button("×").on_hover_text("remove this project").clicked() {
-                        remove = Some(i);
-                    }
-                    ui.end_row();
-                }
-            });
-            if let Some(i) = remove {
-                self.remove(i);
-            }
-            ui.add_space(4.0);
-            if ui.button("+ Add project").clicked() {
-                self.add();
-            }
-            ui.separator();
-            ui.horizontal(|ui| {
-                let save = ui
-                    .add_enabled(can_save && self.dirty(), egui::Button::new("💾 Save"))
-                    .on_hover_text("write the list and reload today's suggestions")
-                    .on_disabled_hover_text(if can_save { "nothing changed" } else { "wait until worklogs are posted and tickets created" });
-                if !self.in_file {
-                    save.clone().on_hover_text("not saved yet: the list comes from .env / config.toml until it is");
-                }
-                if save.clicked() {
-                    saved = self.save();
-                }
-                if ui.add_enabled(self.edited(), egui::Button::new("↺ Revert")).on_hover_text("drop the unsaved changes").clicked() {
-                    self.revert();
-                }
-                if let Some(p) = &self.path {
-                    ui.weak("projects.toml").on_hover_text(p.display().to_string());
-                }
-            });
-            match &self.message {
-                Some(Ok(m)) => {
-                    ui.colored_label(egui::Color32::from_rgb(40, 150, 70), m);
-                }
-                Some(Err(e)) => {
-                    ui.colored_label(egui::Color32::from_rgb(200, 60, 50), e);
-                }
-                None => {}
-            }
+            saved = self.body(ui, can_save);
         });
         (open, saved)
+    }
+
+    /// The section itself: the list, "+ Add project", Save / Revert and the last outcome;
+    /// returns the list just saved, if any. `show` frames it as a window of its own, the main
+    /// window as part of its Settings window.
+    pub fn body(&mut self, ui: &mut egui::Ui, can_save: bool) -> Option<Vec<Project>> {
+        let mut saved = None;
+        ui.label("Suggestions come from the enabled projects only: their git folders are read, and their tickets offered.");
+        ui.add_space(6.0);
+        let mut remove = None;
+        egui::Grid::new("projects").striped(true).num_columns(5).spacing([10.0, 6.0]).show(ui, |ui| {
+            ui.strong("On");
+            ui.strong("Name");
+            ui.strong("Git folder");
+            ui.strong("Jira key");
+            ui.strong("");
+            ui.end_row();
+            for (i, p) in self.rows.iter_mut().enumerate() {
+                ui.checkbox(&mut p.enabled, "").on_hover_text("off: not read, its tickets not suggested; kept for later");
+                ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(140.0).hint_text("name"));
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut p.git_dir).desired_width(300.0).hint_text("repo, or folder of repos (optional)"));
+                    let dir = p.git_dir.trim();
+                    if !dir.is_empty() && !std::path::Path::new(dir).is_dir() {
+                        ui.colored_label(egui::Color32::from_rgb(190, 130, 20), "⚠").on_hover_text("folder not found");
+                    }
+                });
+                ui.add(egui::TextEdit::singleline(&mut p.jira_key).desired_width(80.0).hint_text("KEY"));
+                if ui.small_button("×").on_hover_text("remove this project").clicked() {
+                    remove = Some(i);
+                }
+                ui.end_row();
+            }
+        });
+        if let Some(i) = remove {
+            self.remove(i);
+        }
+        ui.add_space(4.0);
+        if ui.button("+ Add project").clicked() {
+            self.add();
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            let save = ui
+                .add_enabled(can_save && self.dirty(), egui::Button::new("💾 Save"))
+                .on_hover_text("write the list and reload today's suggestions")
+                .on_disabled_hover_text(if can_save { "nothing changed" } else { "wait until worklogs are posted and tickets created" });
+            if !self.in_file {
+                save.clone().on_hover_text("not saved yet: the list comes from .env / config.toml until it is");
+            }
+            if save.clicked() {
+                saved = self.save();
+            }
+            if ui.add_enabled(self.edited(), egui::Button::new("↺ Revert")).on_hover_text("drop the unsaved changes").clicked() {
+                self.revert();
+            }
+            if let Some(p) = &self.path {
+                ui.weak("projects.toml").on_hover_text(p.display().to_string());
+            }
+        });
+        match &self.message {
+            Some(Ok(m)) => {
+                ui.colored_label(egui::Color32::from_rgb(40, 150, 70), m);
+            }
+            Some(Err(e)) => {
+                ui.colored_label(egui::Color32::from_rgb(200, 60, 50), e);
+            }
+            None => {}
+        }
+        saved
     }
 }

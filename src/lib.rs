@@ -15,5 +15,6 @@ pub mod state;
 pub mod ui;
 pub mod ui_issues;
 pub mod ui_projects;
+pub mod ui_settings;
 pub mod ui_tickets;
 

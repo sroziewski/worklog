@@ -15,6 +15,7 @@ use crate::state::{Decision, State};
 use crate::history::History;
 use crate::ui_issues::{BrowserOutcome, IssueBrowser};
 use crate::ui_projects::ProjectsEditor;
+use crate::ui_settings::{self, WindowSection};
 use crate::ui_tickets::{CodeSource, Creator, EVIDENCE_TEXT_SIZE, Outcome, WorkGroup};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +87,9 @@ pub struct WorklogApp {
     /// The "Projects" window; kept while closed, so unsaved edits survive reopening it.
     projects_editor: Option<ProjectsEditor>,
     projects_open: bool,
+    // `projects_editor` above is now the Projects section of the Settings window.
+    /// The Settings window's Window section: loaded at start, changed by its checkbox.
+    window: WindowSection,
     row_ids: flow::RowIds,
 }
 
@@ -159,13 +163,14 @@ pub fn picker_projects(cfg: &Config, jira: &Jira) -> Projects {
         .collect()
 }
 
-pub fn run(cfg: Config, creds: JiraCredentials, date: NaiveDate, state_path: Option<PathBuf>) -> Result<()> {
-    let options = eframe::NativeOptions {
+/// The main window's options; `settings` decides whether it starts above the other windows.
+pub fn native_options(date: NaiveDate, settings: ui_settings::UiSettings) -> eframe::NativeOptions {
+    eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(format!("Worklog — {date}"))
             .with_inner_size([860.0, 560.0])
             .with_min_inner_size([560.0, 320.0])
-            .with_always_on_top(),
+            .with_window_level(ui_settings::window_level(settings.always_on_top)),
         // eframe's default wgpu renderer panicked on this machine ("Failed to create staging
         // buffer for index data"); OpenGL is plenty for a dialog. WORKLOG_RENDERER=wgpu switches back.
         renderer: if std::env::var("WORKLOG_RENDERER").is_ok_and(|v| v.eq_ignore_ascii_case("wgpu")) {
@@ -174,8 +179,14 @@ pub fn run(cfg: Config, creds: JiraCredentials, date: NaiveDate, state_path: Opt
             eframe::Renderer::Glow
         },
         ..Default::default()
-    };
-    let app = WorklogApp::new(cfg, creds, date, state_path);
+    }
+}
+
+pub fn run(cfg: Config, creds: JiraCredentials, date: NaiveDate, state_path: Option<PathBuf>) -> Result<()> {
+    let settings = ui_settings::load_or_default(ui_settings::default_path().as_deref());
+    log::info!("window settings: {settings:?}");
+    let options = native_options(date, settings);
+    let app = WorklogApp::new(cfg, creds, date, state_path, settings);
     log::info!("window opened for {date}");
     let res = eframe::run_native("worklog", options, Box::new(|_cc| Ok(Box::new(app)))).map_err(|e| anyhow::anyhow!("GUI: {e}"));
     match &res {
@@ -186,7 +197,7 @@ pub fn run(cfg: Config, creds: JiraCredentials, date: NaiveDate, state_path: Opt
 }
 
 impl WorklogApp {
-    fn new(cfg: Config, creds: JiraCredentials, date: NaiveDate, state_path: Option<PathBuf>) -> Self {
+    fn new(cfg: Config, creds: JiraCredentials, date: NaiveDate, state_path: Option<PathBuf>, settings: ui_settings::UiSettings) -> Self {
         let phase = start_loading(&cfg, &creds, date);
         Self {
             cfg,
@@ -203,6 +214,7 @@ impl WorklogApp {
             browser_open: false,
             projects_editor: None,
             projects_open: false,
+            window: WindowSection::new(settings),
             row_ids: flow::RowIds::default(),
         }
     }
@@ -234,8 +246,21 @@ impl WorklogApp {
         let can_save = self.can_reload();
         let cfg = &self.cfg;
         let editor = self.projects_editor.get_or_insert_with(|| ProjectsEditor::new(cfg, crate::projects::default_path()));
-        let (open, saved) = editor.show(ctx, can_save);
+        let window = &mut self.window;
+        let mut open = true;
+        let mut saved = None;
+        let mut toggled = false;
+        egui::Window::new("Settings").open(&mut open).default_width(720.0).resizable(true).show(ctx, |ui| {
+            ui.heading("Projects");
+            saved = editor.body(ui, can_save);
+            ui.add_space(10.0);
+            toggled = window.show(ui);
+        });
         self.projects_open = open;
+        if toggled {
+            let level = self.window.apply_toggle(ui_settings::default_path().as_deref());
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        }
         if let Some(list) = saved {
             self.cfg.apply_projects(&list);
             self.reload();
@@ -786,8 +811,8 @@ fn new_ticket_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
 }
 
 fn projects_button(ui: &mut egui::Ui) -> egui::Response {
-    ui.button(egui::RichText::new("⚙ Projects").strong())
-        .on_hover_text("the projects suggestions come from: name, git folder, Jira key; add, remove, disable")
+    ui.button(egui::RichText::new("⚙ Settings").strong())
+        .on_hover_text("the projects suggestions come from (name, git folder, Jira key; add, remove, disable) and the window (always on top)")
 }
 
 /// Starts building the day's report on a thread.

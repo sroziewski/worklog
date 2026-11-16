@@ -356,3 +356,19 @@ fn picker_projects_with_one_project() {
     let cfg = Config { project_keys: vec!["ABC".into()], ctx_env_file: None, jira_url: None, ..Config::default() };
     assert_eq!(ui::picker_projects(&cfg, &Jira::new(&mock.base, "tok-ui")), vec![("ABC".to_string(), "Alpha (ABC)".to_string())]);
 }
+
+#[test]
+fn native_options_title_the_window_with_the_date_and_set_the_saved_window_level() {
+    use eframe::egui::WindowLevel;
+    use worklog::ui_settings::UiSettings;
+    // (always_on_top, date, expected level, expected title)
+    let rows = [
+        (true, chrono::NaiveDate::from_ymd_opt(2026, 3, 17).unwrap(), WindowLevel::AlwaysOnTop, "Worklog — 2026-03-17"),
+        (false, chrono::NaiveDate::from_ymd_opt(2025, 11, 4).unwrap(), WindowLevel::Normal, "Worklog — 2025-11-04"),
+    ];
+    for (on, date, level, title) in rows {
+        let options = ui::native_options(date, UiSettings { always_on_top: on });
+        assert_eq!(options.viewport.window_level, Some(level), "always_on_top = {on}");
+        assert_eq!(options.viewport.title.as_deref(), Some(title), "always_on_top = {on}");
+    }
+}

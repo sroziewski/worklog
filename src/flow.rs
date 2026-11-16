@@ -350,6 +350,6 @@ pub fn default_project(projects: &[(String, String)], project_keys: &[String]) -
 
 /// The warning shown above the rows when no project is enabled.
 pub fn no_project_warning(project_keys: &[String]) -> Option<&'static str> {
-    project_keys.is_empty().then_some("No project is enabled: nothing is read or suggested. Enable one in ⚙ Projects.")
+    project_keys.is_empty().then_some("No project is enabled: nothing is read or suggested. Enable one in ⚙ Settings.")
 }
 

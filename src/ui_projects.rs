@@ -22,6 +22,20 @@ pub struct ProjectsEditor {
     pub message: Option<Result<String, String>>,
 }
 
+/// Widths of the name, git folder and Jira key fields when the grid has `available` points:
+/// what the checkbox, ⚠ and × columns and the spacing leave, mostly to the folder, which holds
+/// the longest text. Below `MIN_FIELDS` the fields keep that width and the window scrolls.
+pub fn field_widths(available: f32) -> (f32, f32, f32) {
+    let rest = (available - FIXED_COLUMNS).max(MIN_FIELDS);
+    let name = (rest * 0.2).clamp(120.0, 260.0);
+    let key = (rest * 0.1).clamp(70.0, 120.0);
+    (name, rest - name - key, key)
+}
+
+/// The checkbox, ⚠ and × columns with the grid and row spacing between them.
+const FIXED_COLUMNS: f32 = 130.0;
+const MIN_FIELDS: f32 = 480.0;
+
 impl ProjectsEditor {
     /// Starts from `cfg`'s projects file list, or, with no file yet, from what `config.toml` and
     /// `.env` configure (`projects::seed`), so the first Save keeps the current setup.
@@ -102,6 +116,7 @@ impl ProjectsEditor {
         ui.label("Suggestions come from the enabled projects only: their git folders are read, and their tickets offered.");
         ui.add_space(6.0);
         let mut remove = None;
+        let (name_w, dir_w, key_w) = field_widths(ui.available_width());
         egui::Grid::new("projects").striped(true).num_columns(5).spacing([10.0, 6.0]).show(ui, |ui| {
             ui.strong("On");
             ui.strong("Name");
@@ -111,15 +126,15 @@ impl ProjectsEditor {
             ui.end_row();
             for (i, p) in self.rows.iter_mut().enumerate() {
                 ui.checkbox(&mut p.enabled, "").on_hover_text("off: not read, its tickets not suggested; kept for later");
-                ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(140.0).hint_text("name"));
+                ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(name_w).hint_text("name"));
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut p.git_dir).desired_width(300.0).hint_text("repo, or folder of repos (optional)"));
+                    ui.add(egui::TextEdit::singleline(&mut p.git_dir).desired_width(dir_w).hint_text("repo, or folder of repos (optional)"));
                     let dir = p.git_dir.trim();
                     if !dir.is_empty() && !std::path::Path::new(dir).is_dir() {
                         ui.colored_label(egui::Color32::from_rgb(190, 130, 20), "⚠").on_hover_text("folder not found");
                     }
                 });
-                ui.add(egui::TextEdit::singleline(&mut p.jira_key).desired_width(80.0).hint_text("KEY"));
+                ui.add(egui::TextEdit::singleline(&mut p.jira_key).desired_width(key_w).hint_text("KEY"));
                 if ui.small_button("×").on_hover_text("remove this project").clicked() {
                     remove = Some(i);
                 }

@@ -1,0 +1,2 @@
+// The first icon resource is the one Explorer, the taskbar and shortcuts show for the exe.
+1 ICON "../icon/worklog.ico"

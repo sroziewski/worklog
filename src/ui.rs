@@ -163,10 +163,22 @@ pub fn picker_projects(cfg: &Config, jira: &Jira) -> Projects {
         .collect()
 }
 
+/// The worklog icon (`assets/icon/worklog.png`, made by `make_icon.py`) for the title bar and
+/// taskbar; `None`, logged, if it cannot be decoded, which only costs the window its icon.
+pub fn app_icon() -> Option<egui::IconData> {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/worklog.png"))
+        .inspect_err(|e| log::warn!("window icon: {e}"))
+        .ok()
+}
+
 /// The main window's options; `settings` decides whether it starts above the other windows.
 pub fn native_options(date: NaiveDate, settings: ui_settings::UiSettings) -> eframe::NativeOptions {
+    let mut viewport = egui::ViewportBuilder::default();
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
     eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+        viewport: viewport
             .with_title(format!("Worklog — {date}"))
             .with_inner_size([860.0, 560.0])
             .with_min_inner_size([560.0, 320.0])
@@ -250,7 +262,9 @@ impl WorklogApp {
         let mut open = true;
         let mut saved = None;
         let mut toggled = false;
-        egui::Window::new("Settings").open(&mut open).default_width(720.0).resizable(true).show(ctx, |ui| {
+        // Wide by default: the git folder paths are long, and the fields grow with the window.
+        let width = (ctx.content_rect().width() - 80.0).clamp(640.0, 1280.0);
+        egui::Window::new("Settings").open(&mut open).default_width(width).resizable(true).show(ctx, |ui| {
             ui.heading("Projects");
             saved = editor.body(ui, can_save);
             ui.add_space(10.0);

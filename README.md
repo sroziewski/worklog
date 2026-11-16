@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icon/worklog.svg" width="128" alt="worklog icon"></p>
+
 # worklog
 
 Suggests Jira worklogs from the day's git activity. At 17:00 on weekdays a window lists the
@@ -149,10 +151,42 @@ is remembered in `ui.toml` for the next start, scheduled or `popup --force`.
 
 ## Install
 
-Requires `git` on `PATH` and Rust (to build).
+Requires `git` on `PATH`, and Rust (https://rustup.rs) to build. Both installers work per user,
+without administrator rights or root, build the release first when it is missing, and can be
+run again to update; your settings are kept. They copy the repository's `.env` to the settings
+folder when there is none there yet, since the installed program no longer sits next to it.
+
+**Windows** (PowerShell, from a clone of the repository):
 
 ```powershell
-cd D:\dev\my\worklog
+powershell -ExecutionPolicy Bypass -File install\windows\install.ps1
+```
+
+- the program in `%LOCALAPPDATA%\Programs\worklog`
+- a **Worklog** Start menu shortcut with the worklog icon (opens today's window, also when the
+  day is already full)
+- the daily prompt in Task Scheduler (`-NoSchedule` skips it)
+- an entry under **Settings › Apps › Installed apps**, which uninstalls it; or run
+  `%LOCALAPPDATA%\Programs\worklog\uninstall.ps1` (`-Purge` also removes
+  `%APPDATA%\worklog`, your settings and history)
+
+**Linux** (bash, from a clone of the repository):
+
+```bash
+./install/linux/install.sh
+```
+
+- `worklog` and `worklog-popup` in `~/.local/bin` (`PREFIX=` elsewhere)
+- the icon and a **Worklog** entry in the application menu
+- the daily prompt as a systemd user timer (`NO_SCHEDULE=1` skips it)
+- uninstall with `~/.local/share/worklog/uninstall.sh` (`PURGE=1` also removes
+  `~/.config/worklog`)
+
+The window needs the usual GUI libraries (libxkbcommon, libGL, and Wayland or X11).
+
+### By hand
+
+```powershell
 cargo build --release
 ```
 
@@ -328,6 +362,12 @@ The same code builds with `cargo build --release`. `worklog install` writes a sy
 it. The service needs `DISPLAY` / `WAYLAND_DISPLAY` in the systemd user environment; most
 desktops import them, otherwise add `systemctl --user import-environment DISPLAY WAYLAND_DISPLAY`
 to your session startup. The Linux path has not been tested yet.
+
+## Icon
+
+`assets/icon/worklog.svg`, `worklog.png` and `worklog.ico` are drawn by
+`assets/icon/make_icon.py` (Pillow) from the same geometry; change it there and run it again.
+`build.rs` embeds the `.ico` in both Windows executables; the window sets the `.png` itself.
 
 ## Development
 

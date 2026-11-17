@@ -118,6 +118,26 @@ pub fn day(y: i32, m: u32, d: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, d).unwrap()
 }
 
+/// The machine zone's UTC offset changes in `year`, read from the UTC side hour by hour so the
+/// result does not depend on how local wall times are resolved: (first UTC instant with the new
+/// offset, old offset seconds, new offset seconds). Empty for a zone without DST.
+pub fn offset_changes(year: i32) -> Vec<(DateTime<chrono::Utc>, i32, i32)> {
+    use chrono::Offset;
+    let offset = |t: &DateTime<chrono::Utc>| Local.offset_from_utc_datetime(&t.naive_utc()).fix().local_minus_utc();
+    let mut t = chrono::Utc.from_utc_datetime(&ndt(day(year, 1, 1), 0, 0, 0));
+    let end = chrono::Utc.from_utc_datetime(&ndt(day(year + 1, 1, 1), 0, 0, 0));
+    let mut out = Vec::new();
+    while t < end {
+        let next = t + chrono::TimeDelta::hours(1);
+        let (old, new) = (offset(&t), offset(&next));
+        if old != new {
+            out.push((next, old, new));
+        }
+        t = next;
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------------------------
 // Git fixtures
 // ---------------------------------------------------------------------------------------------

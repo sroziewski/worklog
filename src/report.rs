@@ -131,10 +131,7 @@ pub fn build_at_with(
     progress(Progress::Step("asking Jira who you are".into()));
     let me = jira.myself()?;
     log::info!("Jira user {me} ({:.2}s)", started.elapsed().as_secs_f64());
-    let mut emails = cfg.author_emails.clone();
-    if emails.is_empty() {
-        emails.extend(fallback_email);
-    }
+    let emails = author_emails(cfg, fallback_email);
     log::info!("author emails: {emails:?}");
     let mut warnings = Vec::new();
     if emails.is_empty() {
@@ -145,33 +142,16 @@ pub fn build_at_with(
     // landing in their repo's "no ticket" row.
     let all_keys: Vec<String> = cfg.project_keys.iter().chain(&cfg.inactive_keys).cloned().collect();
     let matcher = KeyMatcher::new(&all_keys);
-    let collector = Collector { matcher: &matcher, author_emails: &emails, date, include_uncommitted: date == today };
-    let mut repos = git::discover_repos(&cfg.repo_roots);
-    let before = repos.len();
-    repos.retain(|r| cfg.repo_active(r));
-    if repos.len() < before {
-        log::info!("{} repos skipped: they belong to disabled projects", before - repos.len());
-    }
-    if before == 0 && !cfg.repo_roots.is_empty() {
-        warnings.push(format!("no git repos found under {:?}", cfg.repo_roots));
-    }
+    let collector = Collector { matcher: &matcher, author_emails: &emails, span: git::Span::day(date), include_uncommitted: date == today };
+    let repos = active_repos(cfg, &mut warnings);
     let repo_projects = repo_projects(cfg, &repos);
-    let mut repo_paths: BTreeMap<String, Vec<std::path::PathBuf>> = BTreeMap::new();
-    for r in &repos {
-        if let Some(name) = r.file_name() {
-            repo_paths.entry(name.to_string_lossy().into_owned()).or_default().push(r.clone());
-        }
-    }
+    let repo_paths = repo_paths(&repos);
     log::info!("scanning {} repos under {:?} (uncommitted files: {})", repos.len(), cfg.repo_roots, date == today);
     let t = std::time::Instant::now();
     progress(Progress::Scanning(repos.len()));
     let (mut events, errors) = collector.collect_with(&repos, &|e| progress(Progress::Scan(e)));
     log::info!("git: {} events in {:.2}s", events.len(), t.elapsed().as_secs_f64());
-    let before = events.len();
-    events.retain(|e| e.key.as_deref().is_none_or(|k| cfg.key_active(k)));
-    if events.len() < before {
-        log::info!("{} events dropped: their tickets belong to disabled projects", before - events.len());
-    }
+    drop_inactive(cfg, &mut events);
     for e in &errors {
         log::warn!("{e}");
     }
@@ -233,6 +213,50 @@ pub fn build_at_with(
 
     log::info!("done in {:.2}s: {} rows, {} warnings", started.elapsed().as_secs_f64(), rows.len(), warnings.len());
     Ok(Report { date, me, rows, already_logged_minutes: already, budget_minutes: budget, candidates, warnings, repo_projects, repo_paths })
+}
+
+/// The configured author emails, or `fallback` (git's user.email) when none are configured.
+pub fn author_emails(cfg: &Config, fallback: Option<String>) -> Vec<String> {
+    let mut emails = cfg.author_emails.clone();
+    if emails.is_empty() {
+        emails.extend(fallback);
+    }
+    emails
+}
+
+/// The repos under the configured roots that belong to no disabled project; finding none at all
+/// under configured roots is a warning.
+pub fn active_repos(cfg: &Config, warnings: &mut Vec<String>) -> Vec<std::path::PathBuf> {
+    let mut repos = git::discover_repos(&cfg.repo_roots);
+    let before = repos.len();
+    repos.retain(|r| cfg.repo_active(r));
+    if repos.len() < before {
+        log::info!("{} repos skipped: they belong to disabled projects", before - repos.len());
+    }
+    if before == 0 && !cfg.repo_roots.is_empty() {
+        warnings.push(format!("no git repos found under {:?}", cfg.repo_roots));
+    }
+    repos
+}
+
+/// The repos by directory name; one name can stand for several repos.
+pub fn repo_paths(repos: &[std::path::PathBuf]) -> BTreeMap<String, Vec<std::path::PathBuf>> {
+    let mut paths: BTreeMap<String, Vec<std::path::PathBuf>> = BTreeMap::new();
+    for r in repos {
+        if let Some(name) = r.file_name() {
+            paths.entry(name.to_string_lossy().into_owned()).or_default().push(r.clone());
+        }
+    }
+    paths
+}
+
+/// Drops the events whose ticket belongs to a disabled project.
+pub fn drop_inactive(cfg: &Config, events: &mut Vec<git::Event>) {
+    let before = events.len();
+    events.retain(|e| e.key.as_deref().is_none_or(|k| cfg.key_active(k)));
+    if events.len() < before {
+        log::info!("{} events dropped: their tickets belong to disabled projects", before - events.len());
+    }
 }
 
 /// Project of each repo by directory name, the key activity rows use. A name found under roots of

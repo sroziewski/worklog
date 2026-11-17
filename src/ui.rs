@@ -16,6 +16,7 @@ use crate::history::History;
 use crate::ui_issues::{BrowserOutcome, IssueBrowser};
 use crate::ui_projects::ProjectsEditor;
 use crate::ui_settings::{self, WindowSection};
+use crate::ticket_range::MainRow;
 use crate::ui_tickets::{CodeSource, Creator, EVIDENCE_TEXT_SIZE, Outcome, WorkGroup};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -485,10 +486,26 @@ impl WorklogApp {
                         format!("{k}{summary}")
                     }
                     Bucket::Unassigned(_) if st.manual => "row added by hand".to_owned(),
-                    Bucket::Unassigned(repo) => format!("{repo} — no ticket yet"),
+                    Bucket::Unassigned(repo) => crate::ticket_range::unassigned_title(repo),
                 };
                 let project = flow::group_project(&row.suggestion.bucket, st.manual, &report.repo_projects);
                 WorkGroup { row: st.id, title, project, repos: row.suggestion.repos.clone(), lines: row.suggestion.evidence.clone() }
+            })
+            .collect()
+    }
+
+    /// The rows a group read for another span can stand for: those with git activity (not added
+    /// by hand), by bucket, with the title the New ticket window shows for them.
+    fn main_rows(&self, groups: &[WorkGroup]) -> Vec<MainRow> {
+        let Some(report) = &self.report else { return Vec::new() };
+        report
+            .rows
+            .iter()
+            .zip(&self.rows)
+            .filter(|(_, st)| !st.manual)
+            .filter_map(|(row, st)| {
+                let title = groups.iter().find(|g| g.row == st.id)?.title.clone();
+                Some(MainRow { bucket: row.suggestion.bucket.clone(), row: st.id, title })
             })
             .collect()
     }
@@ -769,12 +786,13 @@ impl WorklogApp {
             return;
         }
         let groups = self.work_groups();
+        let main = self.main_rows(&groups);
         let (Some(creator), Some(report)) = (&mut self.creator, &mut self.report) else { return };
         let me = report.me.clone();
         let can_create = matches!(self.phase, Phase::Ready);
-        let code = CodeSource { date: report.date, repo_paths: &report.repo_paths };
+        let code = CodeSource { span: crate::git::Span::day(report.date), repo_paths: &report.repo_paths };
         let history = self.history.as_ref().ok();
-        let (open, outcomes) = creator.show(ctx, &self.cfg, &self.creds, &me, &groups, Some(&code), history, can_create, &self.projects);
+        let (open, outcomes) = creator.show(ctx, &self.cfg, &self.creds, &me, &groups, Some(&code), history, can_create, &self.projects, &main);
         for Outcome::Created { issue, rows } in outcomes {
             let mut picks: Vec<flow::Pick> = self
                 .rows

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Local, NaiveDate, TimeZone};
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeDelta, TimeZone};
 
 use crate::keys::KeyMatcher;
 
@@ -86,10 +86,50 @@ pub fn discover_repos(roots: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
+/// The stretch of time work is read from: `from` inclusive, `to` exclusive, both local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub from: DateTime<Local>,
+    pub to: DateTime<Local>,
+}
+
+impl Span {
+    /// The whole local calendar day.
+    pub fn day(date: NaiveDate) -> Self {
+        let next = date.succ_opt().unwrap_or(date);
+        Self { from: local_midnight(date), to: local_midnight(next) }
+    }
+
+    /// From `from` up to and including `now`.
+    pub fn since(from: DateTime<Local>, now: DateTime<Local>) -> Self {
+        Self { from, to: now + TimeDelta::seconds(1) }
+    }
+
+    pub fn contains(&self, t: &DateTime<Local>) -> bool {
+        *t >= self.from && *t < self.to
+    }
+
+    /// Lower bound for git's committer-date filter. Whether a commit counts is decided on author
+    /// date; a commit is committed no earlier than authored, so only the lower bound is safe to
+    /// pass to git (rebases and cherry-picks push the committer date arbitrarily later). One day
+    /// of slack covers clock skew between machines.
+    fn git_since(&self) -> String {
+        format!("@{}", (self.from - TimeDelta::days(1)).timestamp())
+    }
+}
+
+/// Local midnight of `date`, or the first instant of it when a DST jump skips midnight.
+fn local_midnight(date: NaiveDate) -> DateTime<Local> {
+    let start: NaiveDateTime = date.and_hms_opt(0, 0, 0).expect("midnight exists");
+    (0..=24)
+        .find_map(|h| Local.from_local_datetime(&(start + TimeDelta::hours(h))).earliest())
+        .unwrap_or_else(|| Local.from_utc_datetime(&start))
+}
+
 pub struct Collector<'a> {
     pub matcher: &'a KeyMatcher,
     pub author_emails: &'a [String],
-    pub date: NaiveDate,
+    pub span: Span,
     /// Uncommitted files are a snapshot of now, so they only make sense when `date` is today.
     pub include_uncommitted: bool,
 }
@@ -172,8 +212,8 @@ impl Collector<'_> {
         self.author_emails.iter().any(|m| m.eq_ignore_ascii_case(email.trim()))
     }
 
-    fn on_date(&self, t: &DateTime<Local>) -> bool {
-        t.date_naive() == self.date
+    fn in_span(&self, t: &DateTime<Local>) -> bool {
+        self.span.contains(t)
     }
 
     /// One repo's events, skipping commits whose hash is already in `seen` (and adding its own).
@@ -191,17 +231,9 @@ impl Collector<'_> {
         Ok((commits, other))
     }
 
-    /// Lower bound for git's committer-date filter. The day itself is decided on author date
-    /// below; a commit is committed no earlier than authored, so only the lower bound is safe to
-    /// pass to git (rebases and cherry-picks push the committer date arbitrarily later). One day
-    /// of slack covers clock skew between machines.
-    fn committed_since(&self) -> String {
-        format!("{} 00:00", self.date.pred_opt().unwrap_or(self.date))
-    }
-
     /// My commits authored on the day, with their hashes for the cross-repo dedup.
     fn commits(&self, repo: &Path, name: &str) -> Result<Vec<(String, Event)>> {
-        let since = self.committed_since();
+        let since = self.span.git_since();
         let mut cmd = git(repo);
         // --branches --remotes --tags rather than --all: refs/stash would turn every stash into
         // a "commit" of work.
@@ -218,7 +250,7 @@ impl Collector<'_> {
             let Some(time) = f[2].trim().parse::<i64>().ok().and_then(|s| Local.timestamp_opt(s, 0).single()) else {
                 continue;
             };
-            if !self.on_date(&time) {
+            if !self.in_span(&time) {
                 continue;
             }
             let (subject, body, source) = (f[4], f[5], f[3]);
@@ -254,7 +286,7 @@ impl Collector<'_> {
             else {
                 continue;
             };
-            if !self.on_date(&time) {
+            if !self.in_span(&time) {
                 continue;
             }
             events.push(Event {
@@ -293,7 +325,7 @@ impl Collector<'_> {
             }
             let Ok(modified) = std::fs::metadata(repo.join(path)).and_then(|m| m.modified()) else { continue };
             let time: DateTime<Local> = modified.into();
-            if self.on_date(&time) {
+            if self.in_span(&time) {
                 events.push(Event { repo: name.to_owned(), time, kind: EventKind::Uncommitted, what: path.to_owned(), key: key.clone() });
             }
         }
@@ -332,7 +364,7 @@ const UNTRACKED_READ_BYTES: u64 = 256 * 1024;
 /// day's earliest).
 /// Checkouts and lines nothing is found for give `None`. Each text is cut to `per_item` chars and
 /// all of them together to `total` (later lines get what is left).
-pub fn change_contexts(lines: &[(Vec<PathBuf>, String)], date: NaiveDate, per_item: usize, total: usize) -> Vec<Option<String>> {
+pub fn change_contexts(lines: &[(Vec<PathBuf>, String)], span: Span, per_item: usize, total: usize) -> Vec<Option<String>> {
     let mut subjects: std::collections::HashMap<PathBuf, Vec<(String, String)>> = std::collections::HashMap::new();
     let mut left = total;
     lines
@@ -344,7 +376,7 @@ pub fn change_contexts(lines: &[(Vec<PathBuf>, String)], date: NaiveDate, per_it
             let text = match line.strip_prefix("uncommitted ") {
                 Some(path) => repos.iter().find_map(|r| uncommitted_change(r, path)),
                 None => repos.iter().find_map(|r| {
-                    let list = subjects.entry(r.clone()).or_insert_with(|| day_subjects(r, date));
+                    let list = subjects.entry(r.clone()).or_insert_with(|| span_subjects(r, span));
                     let hash = list.iter().find(|(_, s)| s == line.trim()).map(|(h, _)| h.clone())?;
                     commit_change(r, &hash)
                 }),
@@ -359,8 +391,8 @@ pub fn change_contexts(lines: &[(Vec<PathBuf>, String)], date: NaiveDate, per_it
 /// (hash, subject) of the commits authored on `date` (local time), oldest first. The committer
 /// date filter only narrows git's work (as in `Collector::commits`); a later commit with the same
 /// subject must not stand in for the day's.
-fn day_subjects(repo: &Path, date: NaiveDate) -> Vec<(String, String)> {
-    let since = format!("{} 00:00", date.pred_opt().unwrap_or(date));
+fn span_subjects(repo: &Path, span: Span) -> Vec<(String, String)> {
+    let since = span.git_since();
     let mut cmd = git(repo);
     cmd.args(["log", "--branches", "--remotes", "--tags", "--no-merges", "--reverse"])
         .arg(format!("--since={since}"))
@@ -371,7 +403,7 @@ fn day_subjects(repo: &Path, date: NaiveDate) -> Vec<(String, String)> {
             let mut f = l.splitn(3, FS);
             let (hash, at, subject) = (f.next()?, f.next()?, f.next()?);
             let t = Local.timestamp_opt(at.trim().parse().ok()?, 0).single()?;
-            (t.date_naive() == date).then(|| (hash.to_owned(), subject.trim().to_owned()))
+            span.contains(&t).then(|| (hash.to_owned(), subject.trim().to_owned()))
         })
         .collect()
 }

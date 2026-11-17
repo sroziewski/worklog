@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local, NaiveDate};
 use common::{ME, commit, day, git_as, git_at, init_repo, local_at, set_mtime};
-use worklog::git::{self, Collector, Event, EventKind};
+use worklog::git::{self, Collector, Event, EventKind, Span};
 use worklog::keys::KeyMatcher;
 
 /// The day under test; D-1 .. D+1 are its neighbours.
@@ -32,7 +32,7 @@ fn collect_with(repos: &[PathBuf], emails: &[&str], uncommitted: bool) -> (Vec<E
     common::empty_git_config();
     let m = matcher();
     let emails: Vec<String> = emails.iter().map(|e| e.to_string()).collect();
-    Collector { matcher: &m, author_emails: &emails, date: d(), include_uncommitted: uncommitted }.collect(repos)
+    Collector { matcher: &m, author_emails: &emails, span: Span::day(d()), include_uncommitted: uncommitted }.collect(repos)
 }
 
 fn collect(repos: &[PathBuf]) -> Vec<Event> {
@@ -224,7 +224,7 @@ mod commits {
         commit(&r, &at(d(), 10, 0, 0), "ABC-5 once", "");
         let m = matcher();
         let emails = vec![ME.to_string()];
-        let c = Collector { matcher: &m, author_emails: &emails, date: d(), include_uncommitted: false };
+        let c = Collector { matcher: &m, author_emails: &emails, span: Span::day(d()), include_uncommitted: false };
         let mut seen = HashSet::new();
         assert_eq!(c.collect_repo(&r, &mut seen).unwrap().len(), 1);
         assert_eq!(c.collect_repo(&r, &mut seen).unwrap(), vec![]);
@@ -496,7 +496,7 @@ mod collect_with {
             common::empty_git_config();
             let m = matcher();
             let emails = vec![ME.to_string()];
-            Collector { matcher: &m, author_emails: &emails, date: d(), include_uncommitted: false }.collect_with(repos, &|e| self.on_event(e))
+            Collector { matcher: &m, author_emails: &emails, span: Span::day(d()), include_uncommitted: false }.collect_with(repos, &|e| self.on_event(e))
         }
 
         fn log(&self) -> Vec<ScanEvent> {
@@ -713,6 +713,177 @@ mod collect_with {
         let (events, errors) = probe.scan(std::slice::from_ref(&r));
         assert_eq!((events.len(), errors), (1, vec![]));
         assert_eq!(probe.log(), vec![ScanEvent::Started(r.clone()), finished(&r, Some(1))]);
+    }
+}
+
+mod span {
+    use super::*;
+    use chrono::TimeDelta;
+
+    #[test]
+    fn day_runs_from_its_local_midnight_to_the_next_one() {
+        assert_eq!(Span::day(d()), Span { from: at(d(), 0, 0, 0), to: at(after(1), 0, 0, 0) });
+    }
+
+    #[test]
+    fn since_runs_up_to_and_including_now() {
+        let (from, now) = (at(before(2), 9, 15, 0), at(d(), 14, 40, 30));
+        assert_eq!(Span::since(from, now), Span { from, to: at(d(), 14, 40, 31) });
+    }
+
+    #[test]
+    fn contains_its_start_but_not_its_end() {
+        let span = Span { from: at(before(2), 9, 0, 0), to: at(d(), 12, 0, 0) };
+        // (name, instant, contained)
+        let rows = [
+            ("a second before the start", at(before(2), 8, 59, 59), false),
+            ("the start", at(before(2), 9, 0, 0), true),
+            ("a day in between", at(before(1), 3, 0, 0), true),
+            ("a second before the end", at(d(), 11, 59, 59), true),
+            ("the end", at(d(), 12, 0, 0), false),
+        ];
+        for (name, t, expected) in rows {
+            assert_eq!(span.contains(&t), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn days_of_a_year_follow_each_other_without_gap_or_overlap() {
+        let mut date = day(2026, 1, 1);
+        while date < day(2027, 1, 1) {
+            let next = date.succ_opt().unwrap();
+            assert_eq!(Span::day(date).to, Span::day(next).from, "{date}");
+            date = next;
+        }
+    }
+
+    /// On the days the machine's zone changes its offset the day is shorter or longer by the
+    /// change; read from the UTC side, so it holds in any zone. A zone without DST has no such day.
+    #[test]
+    fn a_dst_day_is_as_long_as_its_wall_clock() {
+        let changes = common::offset_changes(2026);
+        if changes.is_empty() {
+            eprintln!("the machine's time zone has no DST in 2026; nothing to check");
+            return;
+        }
+        for (at_utc, old, new) in changes {
+            let date = (at_utc + TimeDelta::seconds(i64::from(new))).date_naive();
+            let span = Span::day(date);
+            assert_eq!(span.from.date_naive(), date, "{date}");
+            assert_eq!(span.to - span.from, TimeDelta::seconds(24 * 3600 - i64::from(new - old)), "{date}");
+        }
+    }
+}
+
+mod multi_day {
+    use super::*;
+
+    /// D-2 09:00 up to D 12:00.
+    fn span() -> Span {
+        Span { from: at(before(2), 9, 0, 0), to: at(d(), 12, 0, 0) }
+    }
+
+    fn collect_in(repos: &[PathBuf], span: Span, uncommitted: bool) -> Vec<Event> {
+        common::empty_git_config();
+        let m = matcher();
+        let emails = vec![ME.to_string()];
+        let (events, errors) = Collector { matcher: &m, author_emails: &emails, span, include_uncommitted: uncommitted }.collect(repos);
+        assert_eq!(errors, Vec::<String>::new());
+        events
+    }
+
+    #[test]
+    fn commits_authored_on_any_day_of_the_span_count_from_its_first_second_to_before_its_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = new_repo(tmp.path(), "svc");
+        // (subject, author, committer)
+        let chain = [
+            ("ABC-201 just before", at(before(2), 8, 59, 59), at(before(2), 8, 59, 59)),
+            ("ABC-202 first second", at(before(2), 9, 0, 0), at(before(2), 9, 0, 0)),
+            ("ABC-203 middle day", at(before(1), 15, 0, 0), at(before(1), 15, 0, 0)),
+            ("ABC-204 last second", at(d(), 11, 59, 59), at(d(), 11, 59, 59)),
+            ("ABC-205 at the end", at(d(), 12, 0, 0), at(d(), 12, 0, 0)),
+            ("ABC-206 authored in span committed later", at(before(1), 16, 0, 0), at(after(2), 9, 0, 0)),
+            ("ABC-207 authored before span committed inside", at(before(3), 10, 0, 0), at(before(1), 10, 0, 0)),
+        ];
+        for (subject, author, committer) in &chain {
+            git_as(&r, author, committer, ME, &["commit", "-q", "--allow-empty", "-m", subject]);
+        }
+        assert_eq!(
+            collect_in(&[r], span(), false),
+            vec![
+                event("svc", at(before(2), 9, 0, 0), EventKind::Commit, "ABC-202 first second", Some("ABC-202")),
+                event("svc", at(before(1), 15, 0, 0), EventKind::Commit, "ABC-203 middle day", Some("ABC-203")),
+                event("svc", at(before(1), 16, 0, 0), EventKind::Commit, "ABC-206 authored in span committed later", Some("ABC-206")),
+                event("svc", at(d(), 11, 59, 59), EventKind::Commit, "ABC-204 last second", Some("ABC-204")),
+            ]
+        );
+    }
+
+    #[test]
+    fn checkouts_on_any_day_of_the_span_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = new_repo(tmp.path(), "svc");
+        git_at(&r, &at(before(2), 8, 59, 59), &["checkout", "-q", "-b", "feat/abc-301-before"]);
+        git_at(&r, &at(before(2), 9, 0, 0), &["checkout", "-q", "-b", "feat/abc-302-first"]);
+        git_at(&r, &at(before(1), 13, 0, 0), &["checkout", "-q", "-b", "feat/xyz-303-middle"]);
+        git_at(&r, &at(d(), 11, 59, 59), &["checkout", "-q", "main"]);
+        git_at(&r, &at(d(), 12, 0, 0), &["checkout", "-q", "-b", "feat/abc-304-end"]);
+        assert_eq!(
+            collect_in(&[r], span(), false),
+            vec![
+                event("svc", at(before(2), 9, 0, 0), EventKind::Checkout, "feat/abc-302-first", Some("ABC-302")),
+                event("svc", at(before(1), 13, 0, 0), EventKind::Checkout, "feat/xyz-303-middle", Some("XYZ-303")),
+                event("svc", at(d(), 11, 59, 59), EventKind::Checkout, "main", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn uncommitted_files_changed_on_any_day_of_the_span_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = new_repo(tmp.path(), "svc");
+        // (file, modified)
+        let files = [
+            ("before.txt", at(before(2), 8, 59, 59)),
+            ("first.txt", at(before(2), 9, 0, 0)),
+            ("middle.txt", at(before(1), 10, 0, 0)),
+            ("last.txt", at(d(), 11, 59, 59)),
+            ("end.txt", at(d(), 12, 0, 0)),
+        ];
+        for (f, t) in &files {
+            std::fs::write(r.join(f), *f).unwrap();
+            set_mtime(&r.join(f), t);
+        }
+        assert_eq!(
+            collect_in(&[r], span(), true),
+            vec![
+                event("svc", at(before(2), 9, 0, 0), EventKind::Uncommitted, "first.txt", None),
+                event("svc", at(before(1), 10, 0, 0), EventKind::Uncommitted, "middle.txt", None),
+                event("svc", at(d(), 11, 59, 59), EventKind::Uncommitted, "last.txt", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_span_since_a_moment_includes_the_commit_made_at_now() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = new_repo(tmp.path(), "svc");
+        for (subject, t) in [
+            ("ABC-401 before the start", at(before(1), 9, 59, 59)),
+            ("ABC-402 at the start", at(before(1), 10, 0, 0)),
+            ("ABC-403 at now", at(d(), 14, 0, 0)),
+            ("ABC-404 after now", at(d(), 14, 0, 1)),
+        ] {
+            commit(&r, &t, subject, "");
+        }
+        assert_eq!(
+            collect_in(&[r], Span::since(at(before(1), 10, 0, 0), at(d(), 14, 0, 0)), false),
+            vec![
+                event("svc", at(before(1), 10, 0, 0), EventKind::Commit, "ABC-402 at the start", Some("ABC-402")),
+                event("svc", at(d(), 14, 0, 0), EventKind::Commit, "ABC-403 at now", Some("ABC-403")),
+            ]
+        );
     }
 }
 

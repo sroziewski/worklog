@@ -52,7 +52,7 @@ fn commit_files(repo: &Path, when: &DateTime<Local>, subject: &str, body: &str, 
 fn contexts(lines: &[(Vec<PathBuf>, &str)], per_item: usize, total: usize) -> Vec<Option<String>> {
     common::empty_git_config();
     let lines: Vec<(Vec<PathBuf>, String)> = lines.iter().map(|(r, l)| (r.clone(), l.to_string())).collect();
-    git::change_contexts(&lines, d(), per_item, total)
+    git::change_contexts(&lines, git::Span::day(d()), per_item, total)
 }
 
 fn one(repos: &[&PathBuf], line: &str) -> Option<String> {
@@ -258,6 +258,71 @@ mod commits {
         let plain = tmp.path().join("not-a-repo");
         std::fs::create_dir_all(&plain).unwrap();
         assert_eq!(contexts(&[(vec![], "ABC-1 anything"), (vec![plain], "ABC-1 anything")], BIG, BIG), vec![None, None]);
+    }
+}
+
+mod span {
+    use super::*;
+
+    /// D-2 09:00 up to D 12:00.
+    fn span() -> git::Span {
+        git::Span { from: at(before(2), 9, 0), to: at(d(), 12, 0) }
+    }
+
+    fn in_span(r: &Path, lines: &[&str]) -> Vec<Option<String>> {
+        common::empty_git_config();
+        let lines: Vec<(Vec<PathBuf>, String)> = lines.iter().map(|l| (vec![r.to_path_buf()], l.to_string())).collect();
+        git::change_contexts(&lines, span(), BIG, BIG)
+    }
+
+    fn starts_with(got: &Option<String>, prefix: &str, added: &str) -> bool {
+        got.as_deref().is_some_and(|t| t.starts_with(prefix) && t.contains(added))
+    }
+
+    #[test]
+    fn subjects_are_found_on_every_day_of_the_span_and_not_outside_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = new_repo(tmp.path(), "svc");
+        commit_files(&r, &local_at(before(2), 8, 59, 59), "ABC-60 just before", "b", &[("b.txt", "before\n")]);
+        commit_files(&r, &at(before(2), 9, 0), "ABC-61 first minute", "first", &[("f.txt", "first-line\n")]);
+        commit_files(&r, &at(before(1), 14, 0), "ABC-62 middle day", "middle", &[("m.txt", "middle-line\n")]);
+        commit_files(&r, &local_at(d(), 11, 59, 59), "ABC-63 last second", "last", &[("l.txt", "last-line\n")]);
+        commit_files(&r, &at(d(), 12, 0), "ABC-64 at the end", "end", &[("e.txt", "end\n")]);
+        let got = in_span(&r, &["ABC-60 just before", "ABC-61 first minute", "ABC-62 middle day", "ABC-63 last second", "ABC-64 at the end"]);
+        assert_eq!(got.len(), 5);
+        assert_eq!(got[0], None);
+        assert!(starts_with(&got[1], "ABC-61 first minute\n\nfirst\n", "+first-line"), "{:?}", got[1]);
+        assert!(starts_with(&got[2], "ABC-62 middle day\n\nmiddle\n", "+middle-line"), "{:?}", got[2]);
+        assert!(starts_with(&got[3], "ABC-63 last second\n\nlast\n", "+last-line"), "{:?}", got[3]);
+        assert_eq!(got[4], None);
+    }
+
+    #[test]
+    fn same_subject_several_times_gives_the_earliest_inside_the_span() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = new_repo(tmp.path(), "svc");
+        commit_files(&r, &at(before(2), 8, 30), "ABC-65 tune query", "outside before", &[("q.sql", "outside-before\n")]);
+        commit_files(&r, &at(before(1), 10, 0), "ABC-65 tune query", "first inside", &[("q.sql", "first-inside\n")]);
+        commit_files(&r, &at(d(), 9, 0), "ABC-65 tune query", "second inside", &[("q.sql", "second-inside\n")]);
+        let got = in_span(&r, &["ABC-65 tune query"]);
+        assert!(starts_with(&got[0], "ABC-65 tune query\n\nfirst inside\n", "+first-inside"), "{:?}", got[0]);
+        assert!(got[0].as_deref().is_some_and(|t| !t.contains("second inside") && !t.contains("outside before")), "{:?}", got[0]);
+    }
+
+    #[test]
+    fn author_date_decides_within_the_span_not_committer_date() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = new_repo(tmp.path(), "svc");
+        let author = |t: &DateTime<Local>, committer: &DateTime<Local>, subject: &str, file: &str| {
+            write(&r, file, &format!("{subject}\n"));
+            common::git_as(&r, t, committer, common::ME, &["add", "-A"]);
+            common::git_as(&r, t, committer, common::ME, &["commit", "-q", "-m", subject]);
+        };
+        author(&at(before(1), 11, 0), &at(d() + chrono::TimeDelta::days(2), 8, 0), "ABC-66 written inside committed after", "w.txt");
+        author(&at(before(3), 11, 0), &at(before(1), 8, 0), "ABC-67 written before committed inside", "x.txt");
+        let got = in_span(&r, &["ABC-66 written inside committed after", "ABC-67 written before committed inside"]);
+        assert!(starts_with(&got[0], "ABC-66 written inside committed after\n", "+ABC-66 written inside committed after"), "{:?}", got[0]);
+        assert_eq!(got[1], None);
     }
 }
 

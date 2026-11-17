@@ -10,6 +10,8 @@ clap = { version = "4.6.7", features = ["derive"] }
 dirs = "7.0.0"
 dotenvy = "0.15.7"
 eframe = { version = "0.35.0", features = ["glow"] }
+egui_extras = { version = "0.35.0", default-features = false, features = ["datepicker"] }
+jiff = { version = "0.2.46", default-features = false, features = ["std"] }
 log = "0.4.35"
 redb = "2.6"
 regex = "1.13.1"

@@ -716,11 +716,14 @@ mod change_lookup {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use chrono::NaiveDate;
+    use chrono::{Local, NaiveDate, TimeZone};
+    use worklog::git::Span;
     use worklog::ui_tickets::CodeSource;
 
-    fn date() -> NaiveDate {
-        NaiveDate::from_ymd_opt(2026, 11, 4).unwrap()
+    /// Two days and a few hours, so neither end sits on a midnight a day-only lookup would assume.
+    fn span() -> Span {
+        let at = |d: u32, h: u32, m: u32| Local.from_local_datetime(&NaiveDate::from_ymd_opt(2026, 11, d).unwrap().and_hms_opt(h, m, 0).unwrap()).single().unwrap();
+        Span { from: at(2, 9, 15), to: at(4, 17, 40) }
     }
 
     fn repo_paths() -> BTreeMap<String, Vec<PathBuf>> {
@@ -730,14 +733,14 @@ mod change_lookup {
         ])
     }
 
-    type Lookup = (Vec<(Vec<PathBuf>, String)>, Option<NaiveDate>);
+    type Lookup = (Vec<(Vec<PathBuf>, String)>, Option<Span>);
 
     fn lookup(code: bool, send_code: bool) -> Lookup {
         let (both, none, unknown_first) = (strings(&["web", "api"]), strings(&[]), strings(&["gone", "web"]));
         let ticked: Vec<(u64, &[String], &str)> =
             vec![(10, both.as_slice(), "ABC-1 fix login"), (20, none.as_slice(), "typo fix"), (30, unknown_first.as_slice(), "uncommitted pom.xml")];
         let paths = repo_paths();
-        let source = CodeSource { date: date(), repo_paths: &paths };
+        let source = CodeSource { span: span(), repo_paths: &paths };
         ui_tickets::change_lookup(&ticked, code.then_some(&source), send_code)
     }
 
@@ -755,7 +758,7 @@ mod change_lookup {
                     (vec![], "typo fix".to_string()),
                     (p(&[r"C:\r\web"]), "uncommitted pom.xml".to_string()),
                 ],
-                Some(date())
+                Some(span())
             )
         );
     }
@@ -773,8 +776,8 @@ mod change_lookup {
     #[test]
     fn nothing_ticked_still_reports_the_day_when_code_is_sent() {
         let paths = repo_paths();
-        let source = CodeSource { date: date(), repo_paths: &paths };
-        assert_eq!(ui_tickets::change_lookup(&[], Some(&source), true), (vec![], Some(date())));
+        let source = CodeSource { span: span(), repo_paths: &paths };
+        assert_eq!(ui_tickets::change_lookup(&[], Some(&source), true), (vec![], Some(span())));
         assert_eq!(ui_tickets::change_lookup(&[], Some(&source), false), (vec![], None));
     }
 }

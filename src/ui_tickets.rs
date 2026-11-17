@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
-use chrono::NaiveDate;
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime};
 
 use eframe::egui;
 
@@ -16,6 +16,8 @@ use crate::jira::{Issue, Jira, NewIssue};
 use crate::drafting::{self, Stage, WorkItem};
 use crate::history::{self, History};
 use crate::llm::{self, Llm, MAX_DRAFTS, MAX_TITLE_CHARS, TicketDraft};
+use crate::git::Span;
+use crate::ticket_range::{self, MainRow, Preset, Scanned};
 
 /// What the drafting thread reports: each step as it starts, then the result.
 enum Progress {
@@ -26,7 +28,7 @@ enum Progress {
 
 /// Where the code of the ticked lines is: the report's day and its repos by name.
 pub struct CodeSource<'a> {
-    pub date: NaiveDate,
+    pub span: Span,
     pub repo_paths: &'a BTreeMap<String, Vec<PathBuf>>,
 }
 
@@ -130,7 +132,7 @@ pub fn create_tickets(
 
 /// Where to look up the change of each ticked line: (its repos' paths, the line) and the day, or
 /// no paths and no day when no code is to be sent (`send_code` off or no report).
-pub fn change_lookup(ticked: &[(u64, &[String], &str)], code: Option<&CodeSource>, send_code: bool) -> (Vec<(Vec<PathBuf>, String)>, Option<NaiveDate>) {
+pub fn change_lookup(ticked: &[(u64, &[String], &str)], code: Option<&CodeSource>, send_code: bool) -> (Vec<(Vec<PathBuf>, String)>, Option<Span>) {
     let code = code.filter(|_| send_code);
     let sources = ticked
         .iter()
@@ -139,7 +141,7 @@ pub fn change_lookup(ticked: &[(u64, &[String], &str)], code: Option<&CodeSource
             (paths, (*line).to_owned())
         })
         .collect();
-    (sources, code.map(|c| c.date))
+    (sources, code.map(|c| c.span))
 }
 
 fn distinct(rows: impl IntoIterator<Item = u64>) -> Vec<u64> {
@@ -191,6 +193,144 @@ pub struct Creator {
     pub error: Option<String>,
     generating: Option<Generating>,
     creating: Option<Receiver<(usize, Result<String, String>)>>,
+    /// Where the listed work comes from: the main window's rows, or a span read from git here.
+    pub range: RangeChoice,
+}
+
+/// The "Work from" choice and the git read it started.
+pub struct RangeChoice {
+    pub preset: Preset,
+    /// The Custom start, as the date picker and the hour and minute fields hold it.
+    pub custom_date: jiff::civil::Date,
+    pub custom_hour: u32,
+    pub custom_minute: u32,
+    /// The start being read, and where its result arrives.
+    scanning: Option<(NaiveDateTime, Receiver<Scanned>)>,
+    /// Shared so a frame can list it while ticking lines of the window.
+    pub scanned: Option<Arc<Scanned>>,
+}
+
+impl RangeChoice {
+    /// The report's day, with Custom starting at 00:00 of `today`.
+    pub fn new(today: NaiveDate) -> Self {
+        Self { preset: Preset::ReportDay, custom_date: to_jiff(today), custom_hour: 0, custom_minute: 0, scanning: None, scanned: None }
+    }
+
+    pub fn custom_start(&self) -> NaiveDateTime {
+        let date = from_jiff(self.custom_date).unwrap_or(NaiveDate::MIN);
+        date.and_time(NaiveTime::from_hms_opt(self.custom_hour.min(23), self.custom_minute.min(59), 0).unwrap_or(NaiveTime::MIN))
+    }
+
+    /// The listed work comes from a span read here, not from the main window's rows.
+    pub fn is_span(&self) -> bool {
+        self.preset != Preset::ReportDay
+    }
+
+    pub fn scanning(&self) -> bool {
+        self.scanning.is_some()
+    }
+
+    /// The start being read, or the one read last.
+    pub fn shown_start(&self) -> Option<NaiveDateTime> {
+        self.scanning.as_ref().map(|(s, _)| *s).or_else(|| self.scanned.as_ref().map(|s| s.start))
+    }
+
+    /// The Work from controls take input: the window is not busy and no read is running.
+    pub fn controls_enabled(&self, busy: bool) -> bool {
+        !busy && !self.scanning()
+    }
+
+    /// ⟳ reads a preset's span again up to now; Custom has its own button.
+    pub fn can_refresh(&self) -> bool {
+        self.is_span() && self.preset != Preset::Custom && self.scanned.is_some() && !self.scanning()
+    }
+
+    /// Back to the main window's rows; a read still running is dropped.
+    pub fn reset(&mut self) {
+        self.preset = Preset::ReportDay;
+        self.scanning = None;
+        self.scanned = None;
+    }
+}
+
+/// The lines the window lists and where their code is: the main window's rows and `code` for the
+/// report's day, the read span's groups once it has arrived, nothing while it has not.
+pub fn listed<'a>(range: &RangeChoice, scanned: Option<&'a Scanned>, main: &'a [WorkGroup], code: Option<&CodeSource<'a>>) -> (&'a [WorkGroup], Option<CodeSource<'a>>) {
+    match (range.is_span(), scanned) {
+        (false, _) => (main, code.map(|c| CodeSource { span: c.span, repo_paths: c.repo_paths })),
+        (true, Some(s)) => (&s.groups, Some(CodeSource { span: s.span, repo_paths: &s.repo_paths })),
+        (true, None) => (&[], None),
+    }
+}
+
+/// The title a draft names its row by: from the listed groups, else the main window's (a draft
+/// written before the range changed), else the bare id.
+pub fn row_title(row: u64, listed: &[WorkGroup], main: &[WorkGroup]) -> String {
+    listed.iter().chain(main).find(|g| g.row == row).map_or_else(|| format!("row {row}"), |g| g.title.clone())
+}
+
+/// What the work list says in place of (or above) its lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyHint {
+    /// A git read is running; shown with a spinner.
+    Reading,
+    /// A range is chosen but not read yet (Custom before its button).
+    PickStart,
+    /// The range was read and holds nothing for this project.
+    NothingInRange,
+    /// The report's day holds nothing for this project.
+    NothingToday,
+}
+
+impl EmptyHint {
+    pub fn text(self) -> &'static str {
+        match self {
+            EmptyHint::Reading => "reading your work from git…",
+            EmptyHint::PickStart => "pick a start above to list your work since then",
+            EmptyHint::NothingInRange => "no work of yours found for this project in this range",
+            EmptyHint::NothingToday => "no work found for this project today",
+        }
+    }
+}
+
+/// The hint for the work list: a running read always says so; otherwise only an empty list
+/// (`shown_empty`) gets one, by where its lines would come from.
+pub fn empty_hint(range: &RangeChoice, shown_empty: bool) -> Option<EmptyHint> {
+    if range.scanning() {
+        return Some(EmptyHint::Reading);
+    }
+    if !shown_empty {
+        return None;
+    }
+    Some(match (range.is_span(), range.scanned.is_some()) {
+        (false, _) => EmptyHint::NothingToday,
+        (true, false) => EmptyHint::PickStart,
+        (true, true) => EmptyHint::NothingInRange,
+    })
+}
+
+/// The line under the Work from choice: the report's day, the read running, or what the read
+/// found ("since … · 5 commits, 7 lines in 3 groups · 2 repos read"); `None` before anything.
+pub fn status_line(range: &RangeChoice, code: Option<&CodeSource>, now: NaiveDateTime) -> Option<String> {
+    if !range.is_span() {
+        return code.map(|c| format!("the main window's rows: {}", c.span.from.format("%a %Y-%m-%d")));
+    }
+    if let Some((start, _)) = &range.scanning {
+        return Some(format!("reading git {}…", ticket_range::describe_start(*start, now)));
+    }
+    range.scanned.as_ref().map(|s| {
+        let lines: usize = s.groups.iter().map(|g| g.lines.len()).sum();
+        format!("{} · {} commits, {lines} lines in {} groups · {} repos read", ticket_range::describe_start(s.start, now), s.commits, s.groups.len(), s.repos)
+    })
+}
+
+pub fn to_jiff(d: NaiveDate) -> jiff::civil::Date {
+    let (y, m, day) = (i16::try_from(d.year()).unwrap_or(2000), d.month() as i8, d.day() as i8);
+    jiff::civil::Date::new(y, m, day).unwrap_or(jiff::civil::date(2000, 1, 1))
+}
+
+pub fn from_jiff(d: jiff::civil::Date) -> Option<NaiveDate> {
+    NaiveDate::from_ymd_opt(i32::from(d.year()), u32::try_from(d.month()).ok()?, u32::try_from(d.day()).ok()?)
 }
 
 /// What the main window must do after a frame of the creator.
@@ -201,7 +341,56 @@ pub enum Outcome {
 
 impl Creator {
     pub fn new(project: String, origin: Option<u64>) -> Self {
-        Self { project, origin, ticks: BTreeSet::new(), drafts: Vec::new(), error: None, generating: None, creating: None }
+        Self {
+            project,
+            origin,
+            ticks: BTreeSet::new(),
+            drafts: Vec::new(),
+            error: None,
+            generating: None,
+            creating: None,
+            range: RangeChoice::new(Local::now().date_naive()),
+        }
+    }
+
+    /// Lists the work of `preset` from now on: the main window's rows for the report's day,
+    /// otherwise a fresh git read from its start. The ticks go: they name lines of the old list.
+    pub fn choose_range(&mut self, preset: Preset, cfg: &Config, main: &[MainRow]) {
+        self.range.preset = preset;
+        self.ticks.clear();
+        self.error = None;
+        self.range.scanning = None;
+        self.range.scanned = None;
+        let now = Local::now().naive_local();
+        let Some(start) = ticket_range::start_of(preset, now, self.range.custom_start()) else { return };
+        if let Err(e) = ticket_range::check_start(start, now) {
+            self.error = Some(e);
+            return;
+        }
+        let (tx, rx) = channel();
+        let (cfg, main) = (cfg.clone(), main.to_vec());
+        std::thread::spawn(move || {
+            let emails = crate::report::author_emails(&cfg, crate::git::global_user_email());
+            let span = Span::since(ticket_range::local(start), Local::now());
+            let _ = tx.send(ticket_range::scan(&cfg, &emails, start, span, true, &main));
+        });
+        self.range.scanning = Some((start, rx));
+    }
+
+    /// A click on a Work from preset: the preset to read, if any. The current one does nothing;
+    /// Custom only opens its fields (read once the user has set the start), dropping the old list.
+    pub fn click_preset(&mut self, p: Preset) -> Option<Preset> {
+        if p == self.range.preset {
+            return None;
+        }
+        if p != Preset::Custom {
+            return Some(p);
+        }
+        self.range.preset = p;
+        self.range.scanning = None;
+        self.range.scanned = None;
+        self.ticks.clear();
+        None
     }
 
     pub fn busy(&self) -> bool {
@@ -215,6 +404,7 @@ impl Creator {
 
     /// Opened for one row: switch to its project and tick exactly its lines.
     pub fn focus_row(&mut self, group: &WorkGroup) {
+        self.range.reset();
         if let Some(p) = &group.project {
             self.project = p.clone();
         }
@@ -370,6 +560,20 @@ impl Creator {
 
     fn poll(&mut self) -> Vec<Outcome> {
         let mut out = Vec::new();
+        if let Some((_, rx)) = &self.range.scanning {
+            match rx.try_recv() {
+                Ok(scanned) => {
+                    self.range.scanned = Some(Arc::new(scanned));
+                    self.range.scanning = None;
+                    self.ticks.clear();
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.error = Some("reading git stopped unexpectedly".into());
+                    self.range.scanning = None;
+                }
+            }
+        }
         if let Some(g) = &mut self.generating {
             // None: still running; Some(None): the thread died without an answer.
             let mut done: Option<Option<Drafted>> = None;
@@ -437,9 +641,10 @@ impl Creator {
         history: Option<&Arc<History>>,
         can_create: bool,
         projects: &[(String, String)],
+        main: &[MainRow],
     ) -> (bool, Vec<Outcome>) {
         let outcomes = self.poll();
-        if self.busy() {
+        if self.busy() || self.range.scanning() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         let mut open = true;
@@ -451,7 +656,7 @@ impl Creator {
             .resizable(true)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().id_salt("new-ticket-body").show(ui, |ui| {
-                    self.body(ui, cfg, creds, me, groups, code, history, can_create, projects);
+                    self.body(ui, cfg, creds, me, groups, code, history, can_create, projects, main);
                 });
             });
         // Closing mid-request would drop results the user still expects; keep it open until done.
@@ -470,8 +675,13 @@ impl Creator {
         history: Option<&Arc<History>>,
         can_create: bool,
         projects: &[(String, String)],
+        main: &[MainRow],
     ) {
         let editable = !self.busy();
+        let main_groups = groups;
+        let scanned = self.range.scanned.clone();
+        let (groups, code) = listed(&self.range, scanned.as_deref(), main_groups, code);
+        let code = code.as_ref();
         ui.horizontal(|ui| {
             ui.strong("1. Project:");
             ui.add_enabled_ui(editable, |ui| {
@@ -481,15 +691,26 @@ impl Creator {
             });
         });
         ui.add_space(4.0);
+        self.range_ui(ui, cfg, main, code, editable);
+        ui.add_space(4.0);
 
         let items = ticked_items(groups, &self.ticks, &self.project);
-        ui.strong(format!("2. Tick the commits and files the ticket is about ({} ticked):", items.len()));
+        ui.strong(format!("3. Tick the commits and files the ticket is about ({} ticked):", items.len()));
         let shown: Vec<&WorkGroup> = groups.iter().filter(|g| g.visible_in(&self.project) && !g.lines.is_empty()).collect();
         let hidden = groups.iter().filter(|g| !g.visible_in(&self.project) && !g.lines.is_empty()).count();
         egui::Frame::group(ui.style()).show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt("work").max_height(300.0).auto_shrink([false, true]).show(ui, |ui| {
-                if shown.is_empty() {
-                    ui.weak("no work found for this project today");
+                match empty_hint(&self.range, shown.is_empty()) {
+                    Some(EmptyHint::Reading) => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.weak(EmptyHint::Reading.text());
+                        });
+                    }
+                    Some(h) => {
+                        ui.weak(h.text());
+                    }
+                    None => {}
                 }
                 for g in shown {
                     self.group_ui(ui, g, editable);
@@ -504,7 +725,7 @@ impl Creator {
         ui.horizontal(|ui| {
             let can_generate = !items.is_empty() && editable && self.drafts.iter().filter(|d| d.is_created()).count() < MAX_DRAFTS;
             if ui
-                .add_enabled(can_generate, egui::Button::new(egui::RichText::new("3. ✨ Propose tickets").strong()))
+                .add_enabled(can_generate, egui::Button::new(egui::RichText::new("4. ✨ Propose tickets").strong()))
                 .on_hover_text(format!(
                     "{} drafts up to {MAX_DRAFTS} tickets in {} from the ticked lines{}, in four steps: an analyst works \
                      out what the work was for, a writer drafts the tickets, a tester adds test scenarios, a reviewer \
@@ -536,9 +757,9 @@ impl Creator {
             return;
         }
         ui.separator();
-        ui.strong("4. Check and edit the proposals, then create them:");
+        ui.strong("5. Check and edit the proposals, then create them:");
 
-        let title_of = |row: u64| groups.iter().find(|g| g.row == row).map_or_else(|| format!("row {row}"), |g| g.title.clone());
+        let title_of = |row: u64| row_title(row, groups, main_groups);
         for (i, d) in self.drafts.iter_mut().enumerate() {
             ui.push_id(("draft", i), |ui| {
                 let done = d.is_created();
@@ -594,6 +815,75 @@ impl Creator {
                 ui.spinner();
             }
         });
+    }
+
+    /// "2. Work from": the report's day or a start to read git from, with what was read.
+    fn range_ui(&mut self, ui: &mut egui::Ui, cfg: &Config, main: &[MainRow], code: Option<&CodeSource>, editable: bool) {
+        let enabled = self.range.controls_enabled(!editable);
+        let mut chosen = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("2. Work from:");
+            ui.add_enabled_ui(enabled, |ui| {
+                for p in Preset::ALL {
+                    let r = ui.selectable_label(self.range.preset == p, egui::RichText::new(p.label()).size(EVIDENCE_TEXT_SIZE)).on_hover_text(p.hint());
+                    if r.clicked() {
+                        chosen = chosen.or(self.click_preset(p));
+                    }
+                }
+            });
+        });
+        let now = Local::now().naive_local();
+        if self.range.preset == Preset::Custom {
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(enabled, |ui| {
+                    ui.label("since");
+                    ui.add(
+                        egui_extras::DatePickerButton::new(&mut self.range.custom_date)
+                            .id_salt("work-since-date")
+                            .calendar_week(true)
+                            .highlight_weekends(true)
+                            .format("%a %Y-%m-%d"),
+                    );
+                    let two = |n: f64, _: std::ops::RangeInclusive<usize>| format!("{:02}", n as u32);
+                    ui.add(egui::DragValue::new(&mut self.range.custom_hour).range(0..=23).custom_formatter(two)).on_hover_text("hour");
+                    ui.label(":");
+                    ui.add(egui::DragValue::new(&mut self.range.custom_minute).range(0..=59).speed(0.5).custom_formatter(two)).on_hover_text("minute");
+                    let start = self.range.custom_start();
+                    let fresh = self.range.shown_start() != Some(start);
+                    let future = ticket_range::check_start(start, now).err();
+                    let label = if fresh { "📥 List work" } else { "⟳ Read again" };
+                    let button = egui::Button::new(egui::RichText::new(label).strong());
+                    let r = ui
+                        .add_enabled(future.is_none(), button)
+                        .on_hover_text(format!("read your commits, checkouts and changed files {} until now", ticket_range::describe_start(start, now)))
+                        .on_disabled_hover_text(future.unwrap_or_default());
+                    if r.clicked() {
+                        chosen = Some(Preset::Custom);
+                    }
+                });
+            });
+        }
+        if let Some(p) = chosen {
+            self.choose_range(p, cfg, main);
+        }
+
+        let status = status_line(&self.range, code, now);
+        let refresh = self.range.can_refresh();
+        ui.horizontal(|ui| {
+            if let Some(st) = status {
+                ui.weak(st);
+            }
+            if refresh && ui.add_enabled(enabled, egui::Button::new("⟳").small()).on_hover_text("read again up to now").clicked() {
+                self.choose_range(self.range.preset, cfg, main);
+            }
+        });
+        if let Some(s) = self.range.scanned.clone().filter(|s| !s.warnings.is_empty()) {
+            egui::CollapsingHeader::new(format!("⚠ {} warnings while reading git", s.warnings.len())).id_salt("range-warnings").show(ui, |ui| {
+                for w in &s.warnings {
+                    ui.weak(w);
+                }
+            });
+        }
     }
 
     fn group_ui(&mut self, ui: &mut egui::Ui, g: &WorkGroup, editable: bool) {

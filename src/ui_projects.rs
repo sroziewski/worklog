@@ -24,7 +24,7 @@ pub struct ProjectsEditor {
 
 /// Widths of the name, git folder and Jira key fields when the grid has `available` points:
 /// what the checkbox, ⚠ and × columns and the spacing leave, mostly to the folder, which holds
-/// the longest text. Below `MIN_FIELDS` the fields keep that width and the window scrolls.
+/// the longest text. Below `MIN_FIELDS` the fields keep that width and the window grows to fit.
 pub fn field_widths(available: f32) -> (f32, f32, f32) {
     let rest = (available - FIXED_COLUMNS).max(MIN_FIELDS);
     let name = (rest * 0.2).clamp(120.0, 260.0);

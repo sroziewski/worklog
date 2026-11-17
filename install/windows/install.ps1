@@ -34,6 +34,19 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = Resolve-Path (Join-Path $PSScriptRoot '..\..')
 if (-not $Source) { $Source = Join-Path $repo 'target\release' }
+# Absolute and without a trailing '\': they end up quoted in the uninstall command, where a
+# trailing '\' would escape the closing quote and a relative path would point elsewhere.
+$InstallDir, $StartMenuDir, $ConfigDir = $InstallDir, $StartMenuDir, $ConfigDir |
+    ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') }
+
+# Windows PowerShell turns a native command's stderr into a terminating error under 'Stop', and
+# worklog always logs to stderr; its exit code is what counts.
+function Invoke-Native([string]$exe) {
+    $ErrorActionPreference = 'Continue'
+    # stderr lines arrive as error records; blank ones would print as their type name.
+    & $exe @args 2>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" } } |
+        Where-Object { $_.Trim() }
+}
 $exes = 'worklog.exe', 'worklog-popup.exe'
 
 function Step([string]$text) { Write-Host "==> $text" -ForegroundColor Cyan }
@@ -63,14 +76,23 @@ foreach ($e in $exes) {
 Ok "found in $Source"
 
 # A running copy keeps its exe locked, and replacing it under a scheduled prompt would fail halfway.
-$full = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\') + '\'
+$full = $InstallDir + '\'
 $running = Get-Process worklog, worklog-popup -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -and $_.Path.StartsWith($full, [StringComparison]::OrdinalIgnoreCase) }
 if ($running) { Fail 'worklog is running from the install folder; close its window and run this again' }
 
 Step 'Copying the program'
 New-Item -ItemType Directory -Force $InstallDir | Out-Null
-foreach ($e in $exes) { Copy-Item (Join-Path $Source $e) $InstallDir -Force }
+foreach ($e in $exes) {
+    # A virus scan holds an exe for a moment right after it ran; the running check cannot see that.
+    for ($try = 1; ; $try++) {
+        try { Copy-Item (Join-Path $Source $e) $InstallDir -Force; break }
+        catch {
+            if ($try -ge 20) { Fail "cannot replace $InstallDir\$e, something holds it: $($_.Exception.Message)" }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+}
 Copy-Item (Join-Path $PSScriptRoot 'uninstall.ps1') $InstallDir -Force
 Copy-Item (Join-Path $repo 'assets\icon\worklog.ico') $InstallDir -Force
 $exe = Join-Path $InstallDir 'worklog.exe'
@@ -109,9 +131,9 @@ if ($NoSchedule) {
     Warn 'skipped (-NoSchedule); add it later with: worklog install'
 } else {
     Step 'Daily prompt (Task Scheduler)'
-    $out = & $exe install 2>&1
+    $out = Invoke-Native $exe install
     if ($LASTEXITCODE -eq 0) { Ok ($out | Select-Object -Last 1) }
-    else { Warn "not scheduled: $(($out | Out-String).Trim())"; Warn "fix the settings, then run: `"$exe`" install" }
+    else { Warn "not scheduled: $($out | Select-Object -Last 1)"; Warn "fix the settings, then run: `"$exe`" install" }
 }
 
 if (-not $NoRegister) {
@@ -119,7 +141,9 @@ if (-not $NoRegister) {
     $version = ((& $exe --version) -split ' ')[-1]
     $size = [int]((Get-ChildItem $InstallDir -File | Measure-Object Length -Sum).Sum / 1KB)
     New-Item -Force $UninstallKey | Out-Null
-    $uninstall = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$InstallDir\uninstall.ps1`" -InstallDir `"$InstallDir`""
+    # Every location, so an install made elsewhere is also removed from there.
+    $uninstall = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$InstallDir\uninstall.ps1`" -InstallDir `"$InstallDir`"" +
+        " -StartMenuDir `"$StartMenuDir`" -ConfigDir `"$ConfigDir`" -UninstallKey `"$UninstallKey`""
     $values = @{
         DisplayName = 'Worklog'; DisplayVersion = $version; Publisher = 'worklog'
         DisplayIcon = "$exe,0"; InstallLocation = $InstallDir; UninstallString = $uninstall

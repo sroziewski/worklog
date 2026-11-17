@@ -262,9 +262,7 @@ impl WorklogApp {
         let mut open = true;
         let mut saved = None;
         let mut toggled = false;
-        // Wide by default: the git folder paths are long, and the fields grow with the window.
-        let width = (ctx.content_rect().width() - 80.0).clamp(640.0, 1280.0);
-        egui::Window::new("Settings").open(&mut open).default_width(width).resizable(true).show(ctx, |ui| {
+        egui::Window::new("Settings").open(&mut open).default_width(settings_width(ctx.content_rect().width())).resizable(true).show(ctx, |ui| {
             ui.heading("Projects");
             saved = editor.body(ui, can_save);
             ui.add_space(10.0);
@@ -827,6 +825,13 @@ fn new_ticket_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
 fn projects_button(ui: &mut egui::Ui) -> egui::Response {
     ui.button(egui::RichText::new("⚙ Settings").strong())
         .on_hover_text("the projects suggestions come from (name, git folder, Jira key; add, remove, disable) and the window (always on top)")
+}
+
+/// The Settings window's opening width in a main window `content` points wide: 80 narrower,
+/// at least 640 and at most 1280, since the git folder paths are long and the fields grow with
+/// the window (egui keeps a window wider than the screen on it).
+pub fn settings_width(content: f32) -> f32 {
+    (content - 80.0).clamp(640.0, 1280.0)
 }
 
 /// Starts building the day's report on a thread.

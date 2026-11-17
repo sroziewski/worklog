@@ -65,13 +65,18 @@ step "Icon and application menu"
 install -D -m 644 "$repo/assets/icon/worklog.svg" "$data_home/icons/hicolor/scalable/apps/worklog.svg"
 install -D -m 644 "$repo/assets/icon/worklog.png" "$data_home/icons/hicolor/256x256/apps/worklog.png"
 mkdir -p "$data_home/applications"
+# Exec= quoting (Desktop Entry spec): '"', '`', '$' and '\' get a backslash inside the quotes,
+# then the file's string rule doubles every backslash: '$' is written \\$ and '\' itself \\\\.
+# The backslashes go first, so the ones added for the other characters are not doubled again;
+# '%' is doubled.
+exec_path="$(printf '%s' "$bin_dir/worklog" | sed -e 's/\\/\\\\\\\\/g' -e 's/["`$]/\\\\&/g' -e 's/%/%%/g')"
 cat > "$data_home/applications/worklog.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Worklog
 GenericName=Jira worklog helper
 Comment=Suggest today's Jira worklogs from your git activity
-Exec="$bin_dir/worklog" popup --force
+Exec="$exec_path" popup --force
 Icon=worklog
 Terminal=false
 Categories=Office;Development;

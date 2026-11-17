@@ -46,6 +46,7 @@ remove "$data_home/applications/worklog.desktop"
 remove "$data_home/icons/hicolor/scalable/apps/worklog.svg"
 remove "$data_home/icons/hicolor/256x256/apps/worklog.png"
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$data_home/applications" || true
+command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t "$data_home/icons/hicolor" 2>/dev/null || true
 
 step "Program"
 remove "$bin_dir/worklog"

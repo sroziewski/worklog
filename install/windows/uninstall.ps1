@@ -11,10 +11,20 @@ param(
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\worklog'),
     [string]$StartMenuDir = [Environment]::GetFolderPath('Programs'),
     [string]$ConfigDir = (Join-Path $env:APPDATA 'worklog'),
-    [string]$UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\worklog'
+    [string]$UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\worklog',
+    # The task `worklog install` registers; a parameter so tests can use one of their own.
+    [string]$TaskName = '\Worklog\DailyPrompt'
 )
 
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell turns a native command's stderr into a terminating error under 'Stop', and
+# worklog always logs to stderr; its exit code is what counts.
+function Invoke-Native([string]$exe) {
+    $ErrorActionPreference = 'Continue'
+    # stderr lines arrive as error records; blank ones would print as their type name.
+    & $exe @args 2>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" } } |
+        Where-Object { $_.Trim() }
+}
 function Step([string]$text) { Write-Host "==> $text" -ForegroundColor Cyan }
 function Ok([string]$text) { Write-Host "    $([char]0x2713) $text" -ForegroundColor Green }
 function Warn([string]$text) { Write-Host "    ! $text" -ForegroundColor Yellow }
@@ -32,12 +42,12 @@ if ($running) { Fail 'worklog is running; close its window and run this again' }
 
 if (-not $NoSchedule -and (Test-Path $exe)) {
     Step 'Daily prompt'
-    $out = & $exe uninstall 2>&1
+    $out = Invoke-Native $exe uninstall
     if ($LASTEXITCODE -eq 0) { Ok ($out | Select-Object -Last 1) }
     else {
         # `worklog uninstall` reads the settings first; broken settings must not leave the task behind.
-        schtasks.exe /Delete /F /TN '\Worklog\DailyPrompt' 2>$null | Out-Null
-        if ($LASTEXITCODE -eq 0) { Ok 'removed \Worklog\DailyPrompt' } else { Ok 'no scheduled task' }
+        Invoke-Native schtasks.exe /Delete /F /TN $TaskName | Out-Null
+        if ($LASTEXITCODE -eq 0) { Ok "removed $TaskName" } else { Ok 'no scheduled task' }
     }
 }
 

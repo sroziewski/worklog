@@ -286,3 +286,40 @@ mod save {
         assert_eq!(e.message, ok("saved: 0 of 3 projects enabled"));
     }
 }
+
+mod field_widths {
+    use worklog::ui_projects::field_widths;
+
+    /// f32 products such as 1270 * 0.2 are not exact; a thousandth of a pixel is far below what
+    /// the layout can show.
+    const EPS: f32 = 1e-3;
+
+    /// rest = max(available - 130, 480); name = clamp(rest * 0.2, 120, 260);
+    /// key = clamp(rest * 0.1, 70, 120); dir = rest - name - key.
+    #[test]
+    fn split_the_rest_of_the_row_between_name_folder_and_key() {
+        // (case, available, rest, name, dir, key), worked out by hand from the rule above
+        let rows: [(&str, f32, f32, f32, f32, f32); 13] = [
+            ("zero width", 0.0, 480.0, 120.0, 290.0, 70.0),
+            ("negative width", -50.0, 480.0, 120.0, 290.0, 70.0),
+            ("narrow: both minimums", 600.0, 480.0, 120.0, 290.0, 70.0),
+            ("just under the floor", 609.0, 480.0, 120.0, 290.0, 70.0),
+            ("at the floor", 610.0, 480.0, 120.0, 290.0, 70.0),
+            ("just over the floor", 611.0, 481.0, 120.0, 291.0, 70.0),
+            ("name leaves its minimum", 730.0, 600.0, 120.0, 410.0, 70.0),
+            ("key leaves its minimum", 830.0, 700.0, 140.0, 490.0, 70.0),
+            ("default window", 1100.0, 970.0, 194.0, 679.0, 97.0),
+            ("key reaches its maximum", 1330.0, 1200.0, 240.0, 840.0, 120.0),
+            ("wide: key capped, name not yet", 1400.0, 1270.0, 254.0, 896.0, 120.0),
+            ("name reaches its maximum", 1430.0, 1300.0, 260.0, 920.0, 120.0),
+            ("very wide: both maximums", 2000.0, 1870.0, 260.0, 1490.0, 120.0),
+        ];
+        for (case, available, rest, name, dir, key) in rows {
+            let (n, d, k) = field_widths(available);
+            let close = |a: f32, b: f32| (a - b).abs() < EPS;
+            assert!(close(n, name) && close(d, dir) && close(k, key), "{case} ({available}): got (name, dir, key) = ({n}, {d}, {k}), want ({name}, {dir}, {key})");
+            assert!(close(n + d + k, rest), "{case} ({available}): {n} + {d} + {k} != {rest}");
+            assert!(d > n && d > k, "{case} ({available}): the folder ({d}) is not the widest field");
+        }
+    }
+}

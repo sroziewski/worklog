@@ -372,3 +372,13 @@ fn native_options_title_the_window_with_the_date_and_set_the_saved_window_level(
         assert_eq!(options.viewport.title.as_deref(), Some(title), "always_on_top = {on}");
     }
 }
+
+/// (content - 80) kept between 640 and 1280.
+#[test]
+fn settings_window_opens_80_points_narrower_than_the_main_window_within_640_to_1280() {
+    // (content width, expected), worked out by hand from the rule above
+    let rows = [(0.0, 640.0), (500.0, 640.0), (719.0, 640.0), (720.0, 640.0), (721.0, 641.0), (1000.0, 920.0), (1359.0, 1279.0), (1360.0, 1280.0), (1361.0, 1280.0), (2400.0, 1280.0)];
+    for (content, want) in rows {
+        assert_eq!(ui::settings_width(content), want, "content {content}");
+    }
+}

@@ -117,6 +117,7 @@ impl ProjectsEditor {
         ui.add_space(6.0);
         let mut remove = None;
         let (name_w, dir_w, key_w) = field_widths(ui.available_width());
+        let h = ui.spacing().interact_size.y;
         egui::Grid::new("projects").striped(true).num_columns(5).spacing([10.0, 6.0]).show(ui, |ui| {
             ui.strong("On");
             ui.strong("Name");
@@ -126,15 +127,15 @@ impl ProjectsEditor {
             ui.end_row();
             for (i, p) in self.rows.iter_mut().enumerate() {
                 ui.checkbox(&mut p.enabled, "").on_hover_text("off: not read, its tickets not suggested; kept for later");
-                ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(name_w).hint_text("name"));
+                ui.add_sized([name_w, h], egui::TextEdit::singleline(&mut p.name).hint_text("name"));
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut p.git_dir).desired_width(dir_w).hint_text("repo, or folder of repos (optional)"));
+                    ui.add_sized([dir_w, h], egui::TextEdit::singleline(&mut p.git_dir).hint_text("repo, or folder of repos (optional)"));
                     let dir = p.git_dir.trim();
                     if !dir.is_empty() && !std::path::Path::new(dir).is_dir() {
                         ui.colored_label(egui::Color32::from_rgb(190, 130, 20), "⚠").on_hover_text("folder not found");
                     }
                 });
-                ui.add(egui::TextEdit::singleline(&mut p.jira_key).desired_width(key_w).hint_text("KEY"));
+                ui.add_sized([key_w, h], egui::TextEdit::singleline(&mut p.jira_key).hint_text("KEY"));
                 if ui.small_button("×").on_hover_text("remove this project").clicked() {
                     remove = Some(i);
                 }

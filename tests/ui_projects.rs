@@ -323,3 +323,50 @@ mod field_widths {
         }
     }
 }
+
+mod layout {
+    use super::*;
+    use worklog::ui_projects::field_widths;
+
+    fn rect_widths(shape: &eframe::egui::Shape, out: &mut Vec<f32>) {
+        match shape {
+            eframe::egui::Shape::Rect(r) => out.push(r.rect.width()),
+            eframe::egui::Shape::Vec(v) => v.iter().for_each(|s| rect_widths(s, out)),
+            _ => {}
+        }
+    }
+
+    /// egui's grid hands a cell only its column's width of the frame before, so a text field
+    /// asking for more never got it: the fields stayed a few characters wide. Every field must
+    /// be painted at the width `field_widths` gives for the space the section has.
+    #[test]
+    fn each_field_is_painted_as_wide_as_field_widths_says() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut editor = editor_at(&tmp.path().join("projects.toml"));
+        let rows = editor.rows.len();
+        assert!(rows >= 2, "the fixture needs several rows");
+        let ctx = eframe::egui::Context::default();
+        let input = || eframe::egui::RawInput {
+            screen_rect: Some(eframe::egui::Rect::from_min_size(eframe::egui::Pos2::ZERO, eframe::egui::vec2(1200.0, 800.0))),
+            ..Default::default()
+        };
+        let mut available = 0.0;
+        let mut widths = Vec::new();
+        for _ in 0..3 {
+            let out = ctx.run_ui(input(), |ui| {
+                available = ui.available_width();
+                let _ = editor.body(ui, true);
+            });
+            widths.clear();
+            for s in &out.shapes {
+                rect_widths(&s.shape, &mut widths);
+            }
+        }
+        let (name, dir, key) = field_widths(available);
+        assert!(dir > 600.0, "the window is wide enough for a wide folder field ({available} -> {dir})");
+        for (field, want) in [("name", name), ("git folder", dir), ("Jira key", key)] {
+            let n = widths.iter().filter(|w| (**w - want).abs() < 0.5).count();
+            assert_eq!(n, rows, "{field}: {rows} fields {want} wide expected, painted rect widths: {widths:?}");
+        }
+    }
+}

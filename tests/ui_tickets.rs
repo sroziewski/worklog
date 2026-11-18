@@ -8,6 +8,7 @@ use worklog::config::TicketConfig;
 use worklog::drafting::WorkItem;
 use worklog::jira::{Issue, NewIssue};
 use worklog::llm::TicketDraft;
+use worklog::ticket_kind::Kind;
 use worklog::ui_tickets::{self, Creator, Draft, Outcome, WorkGroup};
 
 /// A draft written for XYZ, the project `creator()` starts in.
@@ -28,6 +29,7 @@ fn dp(project: &str, title: &str, description: &str, selected: bool, created: Op
         created: created.map(|r| r.map(str::to_owned).map_err(str::to_owned)),
         rows: rows.to_vec(),
         sources: Vec::new(),
+        kind: Kind::default(),
     }
 }
 
@@ -88,8 +90,8 @@ fn fresh_creator_is_idle_and_empty() {
 fn new_draft_is_selected_uncreated_with_its_project_and_rows() {
     let x = Draft::new("XY", "Title A", "Body B", vec![7, 3]);
     assert_eq!(
-        (x.project.as_str(), x.title.as_str(), x.description.as_str(), x.selected, x.created, x.rows, x.sources),
-        ("XY", "Title A", "Body B", true, None, vec![7, 3], vec![])
+        (x.project.as_str(), x.title.as_str(), x.description.as_str(), x.selected, x.created, x.rows, x.sources, x.kind),
+        ("XY", "Title A", "Body B", true, None, vec![7, 3], vec![], Kind::default())
     );
 }
 

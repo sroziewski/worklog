@@ -18,6 +18,7 @@ use crate::history::{self, History};
 use crate::llm::{self, Llm, MAX_DRAFTS, MAX_TITLE_CHARS, TicketDraft};
 use crate::git::Span;
 use crate::ticket_range::{self, MainRow, Preset, Scanned};
+use crate::ticket_kind::{self, FieldKind, FieldValue, IssueType, Kind, ProjectMeta, RequiredField};
 
 /// What the drafting thread reports: each step as it starts, then the result.
 enum Progress {
@@ -166,20 +167,26 @@ pub struct Draft {
     pub rows: Vec<u64>,
     /// What the draft was made from, kept with the created ticket for regenerating it later.
     pub sources: Vec<WorkItem>,
+    /// Issue type, epic, parent and required field values.
+    pub kind: Kind,
 }
 
 impl Draft {
     pub fn new(project: &str, title: &str, description: &str, rows: Vec<u64>) -> Self {
-        Self { project: project.to_owned(), title: title.to_owned(), description: description.to_owned(), selected: true, created: None, rows, sources: Vec::new() }
+        Self {
+            project: project.to_owned(),
+            title: title.to_owned(),
+            description: description.to_owned(),
+            selected: true,
+            created: None,
+            rows,
+            sources: Vec::new(),
+            kind: Kind::default(),
+        }
     }
 
     fn is_created(&self) -> bool {
         matches!(self.created, Some(Ok(_)))
-    }
-
-    /// What Create sends: selected, titled, and not created already.
-    fn is_sendable(&self) -> bool {
-        self.selected && !self.is_created() && !self.title.trim().is_empty()
     }
 }
 
@@ -195,6 +202,19 @@ pub struct Creator {
     creating: Option<Receiver<(usize, Result<String, String>)>>,
     /// Where the listed work comes from: the main window's rows, or a span read from git here.
     pub range: RangeChoice,
+    /// What each project offers for a draft's kind, read from Jira once per window.
+    pub meta: BTreeMap<String, MetaState>,
+    /// The kind last chosen per project; new drafts of that project start with it.
+    pub defaults: BTreeMap<String, Kind>,
+    /// The search text of each draft's epic list, by draft index.
+    epic_filters: BTreeMap<usize, String>,
+}
+
+/// A project's create metadata: being read, read, or why it could not be.
+pub enum MetaState {
+    Loading(Receiver<Result<ProjectMeta, String>>),
+    Ready(Arc<ProjectMeta>),
+    Failed(String),
 }
 
 /// The "Work from" choice and the git read it started.
@@ -324,6 +344,159 @@ pub fn status_line(range: &RangeChoice, code: Option<&CodeSource>, now: NaiveDat
     })
 }
 
+/// What a draft's kind controls offer.
+pub struct KindControls<'a> {
+    pub types: &'a [IssueType],
+    pub default_type: &'a str,
+    /// The draft's type is a sub-task as Jira (or the fallback offer) flags it.
+    pub subtask: bool,
+    pub meta: Option<&'a ProjectMeta>,
+    pub required: &'a [RequiredField],
+    pub created_parents: &'a [Issue],
+}
+
+/// The type, epic or parent, and required field controls of one draft. Returns (kind changed,
+/// "same for all" clicked); `siblings` says whether other drafts could take it.
+fn kind_ui(ui: &mut egui::Ui, kind: &mut Kind, c: &KindControls, epic_filter: &mut String, siblings: bool) -> (bool, bool) {
+    let before = kind.clone();
+    let mut all = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Type");
+        egui::ComboBox::from_id_salt("type").selected_text(kind.type_name(c.default_type)).show_ui(ui, |ui| {
+            for t in c.types {
+                let on = kind.type_name(c.default_type).eq_ignore_ascii_case(&t.name);
+                if ui.selectable_label(on, &t.name).clicked() {
+                    kind.issue_type = t.name.clone();
+                    kind.subtask = t.subtask;
+                }
+            }
+        });
+        // A type picked this frame is flagged by the offer; otherwise as the window resolved it.
+        let subtask = if kind.issue_type != before.issue_type { kind.subtask } else { c.subtask };
+        let epic_required = c.required.iter().any(|f| f.kind == FieldKind::Epic);
+        if subtask {
+            parent_ui(ui, kind, c);
+        } else if let Some(meta) = c.meta.filter(|m| m.epic_field.is_some() || epic_required) {
+            epic_ui(ui, kind, &meta.epics, epic_filter, epic_required);
+        }
+        for f in c.required.iter().filter(|f| f.kind != FieldKind::Epic) {
+            field_ui(ui, kind, f);
+        }
+        if siblings
+            && ui.small_button("⇊ same for all").on_hover_text("give the other drafts of this project this type, epic, parent and fields").clicked()
+        {
+            all = true;
+        }
+    });
+    (*kind != before, all)
+}
+
+fn epic_ui(ui: &mut egui::Ui, kind: &mut Kind, epics: &[Issue], filter: &mut String, required: bool) {
+    ui.label(if required { "Epic *" } else { "Epic" });
+    let shown = match &kind.epic {
+        Some(k) => epics.iter().find(|e| &e.key == k).map_or_else(|| k.clone(), |e| format!("{} {}", e.key, truncate_chars(&e.summary, 40))),
+        None => "none".to_owned(),
+    };
+    egui::ComboBox::from_id_salt("epic").selected_text(shown).width(260.0).show_ui(ui, |ui| {
+        ui.add(egui::TextEdit::singleline(filter).hint_text("search epics").desired_width(240.0));
+        if ui.selectable_label(kind.epic.is_none(), "— none —").clicked() {
+            kind.epic = None;
+        }
+        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+            for e in ticket_kind::filter_issues(epics, filter) {
+                if ui.selectable_label(kind.epic.as_deref() == Some(&e.key), format!("{} {}", e.key, e.summary)).clicked() {
+                    kind.epic = Some(e.key.clone());
+                }
+            }
+        });
+        if epics.is_empty() {
+            ui.weak("no open epics in this project");
+        }
+    });
+}
+
+fn parent_ui(ui: &mut egui::Ui, kind: &mut Kind, c: &KindControls) {
+    ui.label("Parent");
+    ui.add(egui::TextEdit::singleline(&mut kind.parent).hint_text("KEY-123").desired_width(110.0));
+    let choices = ticket_kind::parent_choices(c.created_parents, c.meta.map(|m| m.parents.as_slice()).unwrap_or_default());
+    egui::ComboBox::from_id_salt("parent").selected_text("▾").width(30.0).show_ui(ui, |ui| {
+        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+            for p in &choices {
+                if ui.selectable_label(kind.parent.trim() == p.key, format!("{} {}", p.key, truncate_chars(&p.summary, 70))).clicked() {
+                    kind.parent = p.key.clone();
+                }
+            }
+            if choices.is_empty() {
+                ui.weak("no open issues found; type the key");
+            }
+        });
+    });
+}
+
+fn field_ui(ui: &mut egui::Ui, kind: &mut Kind, f: &RequiredField) {
+    ui.label(format!("{} *", f.name));
+    match &f.kind {
+        FieldKind::Select(allowed) => {
+            let current = match kind.values.get(&f.id) {
+                Some(FieldValue::One(v)) => v.clone(),
+                _ => "pick…".to_owned(),
+            };
+            egui::ComboBox::from_id_salt(("field", &f.id)).selected_text(current).show_ui(ui, |ui| {
+                for v in allowed {
+                    let on = matches!(kind.values.get(&f.id), Some(FieldValue::One(x)) if x == v);
+                    if ui.selectable_label(on, v).clicked() {
+                        kind.values.insert(f.id.clone(), FieldValue::One(v.clone()));
+                    }
+                }
+            });
+        }
+        FieldKind::MultiSelect(allowed) => {
+            let mut set = match kind.values.get(&f.id) {
+                Some(FieldValue::Many(vs)) => vs.clone(),
+                _ => BTreeSet::new(),
+            };
+            let shown = if set.is_empty() { "pick…".to_owned() } else { set.iter().cloned().collect::<Vec<_>>().join(", ") };
+            egui::ComboBox::from_id_salt(("field", &f.id))
+                .selected_text(truncate_chars(&shown, 40))
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show_ui(ui, |ui| {
+                    for v in allowed {
+                        let mut on = set.contains(v);
+                        if ui.checkbox(&mut on, v).changed() {
+                            if on {
+                                set.insert(v.clone());
+                            } else {
+                                set.remove(v);
+                            }
+                        }
+                    }
+                });
+            if set.is_empty() {
+                kind.values.remove(&f.id);
+            } else {
+                kind.values.insert(f.id.clone(), FieldValue::Many(set));
+            }
+        }
+        FieldKind::Text => {
+            let mut text = match kind.values.get(&f.id) {
+                Some(FieldValue::Text(t)) => t.clone(),
+                _ => String::new(),
+            };
+            if ui.add(egui::TextEdit::singleline(&mut text).desired_width(160.0)).changed() {
+                kind.values.insert(f.id.clone(), FieldValue::Text(text));
+            }
+        }
+        FieldKind::Unsupported(t) => {
+            ui.weak(format!("({t}: set it in WORKLOG_TICKET_FIELDS)"));
+        }
+        FieldKind::Epic => {}
+    }
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max { s.to_owned() } else { format!("{}…", s.chars().take(max).collect::<String>()) }
+}
+
 pub fn to_jiff(d: NaiveDate) -> jiff::civil::Date {
     let (y, m, day) = (i16::try_from(d.year()).unwrap_or(2000), d.month() as i8, d.day() as i8);
     jiff::civil::Date::new(y, m, day).unwrap_or(jiff::civil::date(2000, 1, 1))
@@ -350,7 +523,146 @@ impl Creator {
             generating: None,
             creating: None,
             range: RangeChoice::new(Local::now().date_naive()),
+            meta: BTreeMap::new(),
+            defaults: BTreeMap::new(),
+            epic_filters: BTreeMap::new(),
         }
+    }
+
+    /// What `project` offers, once read.
+    pub fn meta_of(&self, project: &str) -> Option<Arc<ProjectMeta>> {
+        match self.meta.get(project) {
+            Some(MetaState::Ready(m)) => Some(m.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn set_meta(&mut self, project: &str, meta: ProjectMeta) {
+        self.meta.insert(project.to_owned(), MetaState::Ready(Arc::new(meta)));
+    }
+
+    /// Starts reading `project`'s create metadata unless it is read, being read, or failed (a
+    /// failure is read again only on ⟳, which drops it).
+    pub fn ensure_meta(&mut self, cfg: &TicketConfig, creds: &JiraCredentials, project: &str) {
+        if self.meta.contains_key(project) {
+            return;
+        }
+        let (tx, rx) = channel();
+        let (creds, project_key) = (creds.clone(), project.to_owned());
+        let (wanted, default, provided) = (cfg.issue_types.clone(), cfg.issue_type.clone(), cfg.fields.clone());
+        std::thread::spawn(move || {
+            let jira = Jira::new(&creds.url, &creds.token);
+            let res = ticket_kind::load(&jira, &project_key, &wanted, &default, &provided).map_err(|e| format!("{e:#}"));
+            match &res {
+                Ok(m) => log::info!(
+                    "{project_key}: {} issue types, {} epics, {} parent candidates, epic field {:?}, {} warnings",
+                    m.types.len(),
+                    m.epics.len(),
+                    m.parents.len(),
+                    m.epic_field,
+                    m.warnings.len()
+                ),
+                Err(e) => log::warn!("{project_key}: reading issue types: {e}"),
+            }
+            let _ = tx.send(res);
+        });
+        self.meta.insert(project.to_owned(), MetaState::Loading(rx));
+    }
+
+    /// The fields draft `i`'s type requires, as far as its project's metadata is read.
+    pub fn required_for(&self, i: usize, default_type: &str) -> Vec<RequiredField> {
+        let Some(d) = self.drafts.get(i) else { return Vec::new() };
+        let kind = self.effective_kind(i, default_type);
+        self.meta_of(&d.project).and_then(|m| m.required.get(kind.type_name(default_type)).cloned()).unwrap_or_default()
+    }
+
+    /// Draft `i`'s kind with its type (the chosen one or `default_type`) spelled and flagged as
+    /// its project's Jira type of that name, any case, once the project is read; as it is before.
+    pub fn effective_kind(&self, i: usize, default_type: &str) -> Kind {
+        let Some(d) = self.drafts.get(i) else { return Kind::default() };
+        let mut kind = d.kind.clone();
+        let name = kind.type_name(default_type).trim().to_owned();
+        match self.meta_of(&d.project) {
+            Some(m) => {
+                if let Some(t) = m.types.iter().find(|t| t.name.eq_ignore_ascii_case(&name)) {
+                    kind.issue_type = t.name.clone();
+                    kind.subtask = t.subtask;
+                }
+            }
+            // Unread (or unreadable) project: the default is flagged as the fallback offer flags it.
+            None if d.kind.issue_type.trim().is_empty() => kind.subtask = name.to_lowercase().contains("sub"),
+            None => {}
+        }
+        kind
+    }
+
+    /// What keeps draft `i` from being created, as the window says it; empty when nothing does.
+    pub fn draft_blockers(&self, i: usize, default_type: &str) -> Vec<String> {
+        let Some(d) = self.drafts.get(i) else { return Vec::new() };
+        let mut out = Vec::new();
+        if d.title.trim().is_empty() {
+            out.push("a title".to_owned());
+        }
+        out.extend(ticket_kind::blockers(&self.effective_kind(i, default_type), &d.project, &self.required_for(i, default_type)));
+        out
+    }
+
+    /// What Create sends: selected, not created already, and nothing missing.
+    pub fn sendable(&self, i: usize, default_type: &str) -> bool {
+        self.drafts.get(i).is_some_and(|d| d.selected && !d.is_created()) && self.draft_blockers(i, default_type).is_empty()
+    }
+
+    /// Gives draft `i` `kind`, which new drafts of its project then start with.
+    pub fn set_kind(&mut self, i: usize, kind: Kind) {
+        let Some(d) = self.drafts.get_mut(i) else { return };
+        self.defaults.insert(d.project.clone(), kind.clone());
+        d.kind = kind;
+    }
+
+    /// Gives draft `i`'s kind to every other draft of its project not created yet.
+    pub fn same_for_all(&mut self, i: usize) {
+        let Some(src) = self.drafts.get(i) else { return };
+        let (project, kind) = (src.project.clone(), src.kind.clone());
+        for (j, d) in self.drafts.iter_mut().enumerate() {
+            if j != i && d.project == project && !d.is_created() {
+                d.kind = kind.clone();
+            }
+        }
+    }
+
+    /// The kind a new draft of `project` starts with.
+    fn default_kind(&self, project: &str) -> Kind {
+        self.defaults.get(project).cloned().unwrap_or_default()
+    }
+
+    /// "Create 3 (2 Task, 1 Bug) in HD as jdoe" for the drafts Create would send.
+    pub fn create_label(&self, cfg: &TicketConfig, me: &str) -> String {
+        let sendable_ids: Vec<usize> = (0..self.drafts.len()).filter(|&i| self.sendable(i, &cfg.issue_type)).collect();
+        let kinds: Vec<Kind> = sendable_ids.iter().map(|&i| self.effective_kind(i, &cfg.issue_type)).collect();
+        let sendable: Vec<&Draft> = sendable_ids.iter().map(|&i| &self.drafts[i]).collect();
+        let mut targets: Vec<&str> = Vec::new();
+        for d in &sendable {
+            if !targets.contains(&d.project.as_str()) {
+                targets.push(&d.project);
+            }
+        }
+        let place = if targets.is_empty() { "Jira".to_owned() } else { targets.join(" + ") };
+        let counts = ticket_kind::type_counts(kinds.iter().map(|k| k.type_name(&cfg.issue_type)));
+        let counts = if counts.is_empty() { String::new() } else { format!(" ({counts})") };
+        format!("Create {}{counts} in {place} as {me}", sendable.len())
+    }
+
+    /// Tickets created in this window that a sub-task of `project` can go under, newest first.
+    pub fn created_parents(&self, project: &str, default_type: &str) -> Vec<Issue> {
+        (0..self.drafts.len())
+            .rev()
+            .filter(|&i| self.drafts[i].project == project && !self.effective_kind(i, default_type).subtask)
+            .map(|i| &self.drafts[i])
+            .filter_map(|d| match &d.created {
+                Some(Ok(key)) => Some(Issue { key: key.clone(), summary: d.title.trim().to_owned(), status: "new".into() }),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Lists the work of `preset` from now on: the main window's rows for the report's day,
@@ -421,6 +733,7 @@ impl Creator {
             rows.extend(self.origin.filter(|&o| groups.iter().any(|g| g.row == o && g.visible_in(&self.project))));
         }
         let mut d = Draft::new(&self.project, "", "", rows);
+        d.kind = self.default_kind(&self.project);
         let mut lines: Vec<String> = ticked_items(groups, &self.ticks, &self.project).into_iter().map(|(_, t)| t).collect();
         if lines.is_empty() {
             lines = groups
@@ -488,18 +801,21 @@ impl Creator {
 
     /// The drafts Create sends, by draft index: selected, titled, and not created already.
     pub fn create_jobs(&self, cfg: &TicketConfig, me: &str) -> Vec<(usize, NewIssue)> {
-        self.drafts
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| d.is_sendable())
-            .map(|(i, d)| {
+        (0..self.drafts.len())
+            .filter(|&i| self.sendable(i, &cfg.issue_type))
+            .map(|i| {
+                let d = &self.drafts[i];
+                let epic_field = self.meta_of(&d.project).and_then(|m| m.epic_field.clone());
+                let mut extra_fields = cfg.fields.clone();
+                let kind = self.effective_kind(i, &cfg.issue_type);
+                extra_fields.extend(ticket_kind::kind_fields(&kind, epic_field.as_deref(), &self.required_for(i, &cfg.issue_type)));
                 let new = NewIssue {
                     project: d.project.clone(),
-                    issue_type: cfg.issue_type.clone(),
+                    issue_type: kind.type_name(&cfg.issue_type).to_owned(),
                     summary: d.title.trim().to_owned(),
                     description: d.description.trim().to_owned(),
                     assignee: Some(me.to_owned()),
-                    extra_fields: cfg.fields.clone(),
+                    extra_fields,
                 };
                 (i, new)
             })
@@ -522,7 +838,9 @@ impl Creator {
                     if rows.is_empty() && lone {
                         rows = distinct(item_rows.iter().copied());
                     }
-                    self.drafts.push(Draft::new(&self.project, &d.title, &d.description, rows));
+                    let mut draft = Draft::new(&self.project, &d.title, &d.description, rows);
+                    draft.kind = self.default_kind(&self.project);
+                    self.drafts.push(draft);
                 }
                 self.error = None;
             }
@@ -558,8 +876,24 @@ impl Creator {
         self.creating = Some(rx);
     }
 
+    /// Takes in the project metadata reads that have finished: read, failed, or their thread
+    /// gone without an answer.
+    pub fn poll_meta(&mut self) {
+        for state in self.meta.values_mut() {
+            if let MetaState::Loading(rx) = state {
+                match rx.try_recv() {
+                    Ok(Ok(m)) => *state = MetaState::Ready(Arc::new(m)),
+                    Ok(Err(e)) => *state = MetaState::Failed(e),
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => *state = MetaState::Failed("reading Jira stopped unexpectedly".into()),
+                }
+            }
+        }
+    }
+
     fn poll(&mut self) -> Vec<Outcome> {
         let mut out = Vec::new();
+        self.poll_meta();
         if let Some((_, rx)) = &self.range.scanning {
             match rx.try_recv() {
                 Ok(scanned) => {
@@ -644,7 +978,7 @@ impl Creator {
         main: &[MainRow],
     ) -> (bool, Vec<Outcome>) {
         let outcomes = self.poll();
-        if self.busy() || self.range.scanning() {
+        if self.busy() || self.range.scanning() || self.meta.values().any(|m| matches!(m, MetaState::Loading(_))) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         let mut open = true;
@@ -758,8 +1092,30 @@ impl Creator {
         }
         ui.separator();
         ui.strong("5. Check and edit the proposals, then create them:");
+        let draft_projects: BTreeSet<String> = self.drafts.iter().map(|d| d.project.clone()).collect();
+        for p in &draft_projects {
+            self.ensure_meta(&cfg.tickets, creds, p);
+        }
+        self.meta_status_ui(ui, &draft_projects);
+
+        let default_type = cfg.tickets.issue_type.clone();
+        let fallback = ticket_kind::fallback_types(&cfg.tickets.issue_types, &default_type);
+        let mut kind_changes: Vec<(usize, Kind)> = Vec::new();
+        let mut same_all: Option<usize> = None;
+        let metas: Vec<Option<Arc<ProjectMeta>>> = self.drafts.iter().map(|d| self.meta_of(&d.project)).collect();
+        let requireds: Vec<Vec<RequiredField>> = (0..self.drafts.len()).map(|i| self.required_for(i, &default_type)).collect();
+        let blockers: Vec<Vec<String>> = (0..self.drafts.len()).map(|i| self.draft_blockers(i, &default_type)).collect();
+        let created_parents: BTreeMap<String, Vec<Issue>> = draft_projects.iter().map(|p| (p.clone(), self.created_parents(p, &default_type))).collect();
+        let subtasks: Vec<bool> = (0..self.drafts.len()).map(|i| self.effective_kind(i, &default_type).subtask).collect();
+        let siblings: Vec<bool> = self
+            .drafts
+            .iter()
+            .enumerate()
+            .map(|(i, d)| self.drafts.iter().enumerate().any(|(j, o)| j != i && o.project == d.project && !o.is_created()))
+            .collect();
 
         let title_of = |row: u64| row_title(row, groups, main_groups);
+        let epic_filters = &mut self.epic_filters;
         for (i, d) in self.drafts.iter_mut().enumerate() {
             ui.push_id(("draft", i), |ui| {
                 let done = d.is_created();
@@ -779,10 +1135,32 @@ impl Creator {
                         None => {}
                     }
                 });
+                let types = metas[i].as_ref().map_or(&fallback, |m| if m.types.is_empty() { &fallback } else { &m.types });
+                let parents = created_parents.get(&d.project).map(Vec::as_slice).unwrap_or_default();
+                let mut kind = d.kind.clone();
+                let ctl = KindControls {
+                    types,
+                    default_type: &default_type,
+                    subtask: subtasks[i],
+                    meta: metas[i].as_deref(),
+                    required: &requireds[i],
+                    created_parents: parents,
+                };
+                let epic_filter = epic_filters.entry(i).or_default();
+                let (changed, all) = ui.add_enabled_ui(editable && !done, |ui| kind_ui(ui, &mut kind, &ctl, epic_filter, siblings[i])).inner;
+                if changed {
+                    kind_changes.push((i, kind));
+                }
+                if all {
+                    same_all = Some(i);
+                }
                 ui.add_enabled(
                     editable && !done,
                     egui::TextEdit::multiline(&mut d.description).hint_text("description").desired_rows(4).desired_width(f32::INFINITY),
                 );
+                if !done && d.selected && !blockers[i].is_empty() {
+                    ui.colored_label(egui::Color32::from_rgb(210, 140, 30), format!("missing: {}", blockers[i].join(", ")));
+                }
                 let rows: Vec<String> = d.rows.iter().map(|&r| title_of(r)).collect();
                 let from = if rows.is_empty() { String::new() } else { format!(" · drafted from: {}", rows.join("; ")) };
                 let note = if done {
@@ -795,19 +1173,19 @@ impl Creator {
             });
         }
 
-        let todo = self.drafts.iter().filter(|d| d.is_sendable()).count();
+        for (i, kind) in kind_changes {
+            self.set_kind(i, kind);
+        }
+        if let Some(i) = same_all {
+            self.same_for_all(i);
+        }
+
+        let todo = (0..self.drafts.len()).filter(|&i| self.sendable(i, &default_type)).count();
         ui.horizontal(|ui| {
-            let mut targets: Vec<&str> = Vec::new();
-            for d in self.drafts.iter().filter(|d| d.is_sendable()) {
-                if !targets.contains(&d.project.as_str()) {
-                    targets.push(&d.project);
-                }
-            }
-            let place = if targets.is_empty() { "Jira".to_owned() } else { targets.join(" + ") };
-            let label = format!("Create {todo} in {place} ({} as {})", cfg.tickets.issue_type, me);
+            let label = self.create_label(&cfg.tickets, me);
             let button = ui
                 .add_enabled(todo > 0 && editable && can_create, egui::Button::new(egui::RichText::new(label).strong()))
-                .on_disabled_hover_text(if can_create { "tick a titled draft" } else { "wait until the worklogs are posted" });
+                .on_disabled_hover_text(if can_create { "tick a draft with nothing missing" } else { "wait until the worklogs are posted" });
             if button.clicked() {
                 self.create(cfg, creds, me, history.cloned());
             }
@@ -815,6 +1193,38 @@ impl Creator {
                 ui.spinner();
             }
         });
+    }
+
+    /// One line per project of the drafts whose metadata is being read or failed; ⟳ reads a
+    /// failed one again.
+    fn meta_status_ui(&mut self, ui: &mut egui::Ui, projects: &BTreeSet<String>) {
+        let mut retry = None;
+        for p in projects {
+            match self.meta.get(p) {
+                Some(MetaState::Loading(_)) => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak(format!("reading {p}'s issue types, epics and required fields…"));
+                    });
+                }
+                Some(MetaState::Failed(e)) => {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(egui::Color32::from_rgb(210, 140, 30), format!("⚠ {p}: issue types not read; offering the configured ones"))
+                            .on_hover_text(e);
+                        if ui.small_button("⟳").on_hover_text("read again").clicked() {
+                            retry = Some(p.clone());
+                        }
+                    });
+                }
+                Some(MetaState::Ready(m)) if !m.warnings.is_empty() => {
+                    ui.weak(format!("⚠ {p}: {} parts not read", m.warnings.len())).on_hover_text(m.warnings.join("\n"));
+                }
+                _ => {}
+            }
+        }
+        if let Some(p) = retry {
+            self.meta.remove(&p);
+        }
     }
 
     /// "2. Work from": the report's day or a start to read git from, with what was read.

@@ -257,6 +257,38 @@ impl Jira {
         Ok(())
     }
 
+    /// The issue types `project` can create (`createmeta/{project}/issuetypes`).
+    pub fn issue_types(&self, project: &str) -> Result<Vec<crate::ticket_kind::IssueType>> {
+        let v = self.get(&format!("/rest/api/2/issue/createmeta/{}/issuetypes", url_encode(project)))?;
+        Ok(crate::ticket_kind::parse_issue_types(&v))
+    }
+
+    /// The create fields of one issue type of `project`, as Jira returns them.
+    pub fn create_fields(&self, project: &str, type_id: &str) -> Result<Value> {
+        self.get(&format!("/rest/api/2/issue/createmeta/{}/issuetypes/{}?maxResults=500", url_encode(project), url_encode(type_id)))
+    }
+
+    /// Every field Jira knows (`/rest/api/2/field`).
+    pub fn fields(&self) -> Result<Value> {
+        self.get("/rest/api/2/field")
+    }
+
+    /// Open epics of `project`, most recently updated first.
+    pub fn epics(&self, project: &str, max_results: u32) -> Result<Vec<Issue>> {
+        self.search(&format!("project = \"{project}\" AND issuetype = Epic AND resolution = Unresolved ORDER BY updated DESC"), max_results)
+    }
+
+    /// Open issues of `project` a sub-task can go under (no sub-tasks, no epics), most recently
+    /// updated first.
+    pub fn parent_candidates(&self, project: &str, max_results: u32) -> Result<Vec<Issue>> {
+        self.search(
+            &format!(
+                "project = \"{project}\" AND resolution = Unresolved AND issuetype not in subTaskIssueTypes() AND issuetype != Epic ORDER BY updated DESC"
+            ),
+            max_results,
+        )
+    }
+
     /// Creates an issue; returns its key.
     pub fn create_issue(&self, new: &NewIssue) -> Result<String> {
         let v = self.post("/rest/api/2/issue", &create_body(new))?;

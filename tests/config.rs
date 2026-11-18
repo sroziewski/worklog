@@ -25,6 +25,7 @@ mod tickets {
     fn default_tickets() -> TicketConfig {
         TicketConfig {
             issue_type: "Task".into(),
+            issue_types: vec!["Task".into(), "Story".into(), "Bug".into(), "Sub-task".into()],
             fields: serde_json::Map::new(),
             language: "Polish".into(),
             opencode_config: Some(dirs::home_dir().unwrap().join(".config").join("opencode").join("opencode.json")),
@@ -49,6 +50,8 @@ mod tickets {
         type Row = (&'static str, fn(&mut TicketConfig));
         let rows: Vec<Row> = vec![
             ("issue_type = \"Story\"", |t| t.issue_type = "Story".into()),
+            ("issue_types = [\"Bug\", \"Sub-task\"]", |t| t.issue_types = vec!["Bug".into(), "Sub-task".into()]),
+            ("issue_types = []", |t| t.issue_types = vec![]),
             ("language = \"Deutsch\"", |t| t.language = "Deutsch".into()),
             ("opencode_config = 'E:\\cfg\\oc.json'", |t| t.opencode_config = Some(PathBuf::from(r"E:\cfg\oc.json"))),
             ("llm_provider = \"zeta\"", |t| t.llm_provider = "zeta".into()),
@@ -164,6 +167,7 @@ mod parse {
 
             [tickets]
             issue_type = "Bug"
+            issue_types = ["Bug", "Improvement"]
             language = "English"
             opencode_config = 'C:\tmp\oc.json'
             llm_provider = "acme"
@@ -191,6 +195,7 @@ mod parse {
                 jira_url: Some("https://jira.example.test".into()),
                 tickets: TicketConfig {
                     issue_type: "Bug".into(),
+                    issue_types: vec!["Bug".into(), "Improvement".into()],
                     fields: json_map(json!({"priority": {"name": "Minor"}})),
                     language: "English".into(),
                     opencode_config: Some(PathBuf::from(r"C:\tmp\oc.json")),

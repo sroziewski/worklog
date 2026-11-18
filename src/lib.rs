@@ -12,6 +12,7 @@ pub mod projects;
 pub mod report;
 pub mod schedule;
 pub mod state;
+pub mod ticket_kind;
 pub mod ticket_range;
 pub mod ui;
 pub mod ui_issues;

@@ -54,6 +54,9 @@ pub struct Config {
 pub struct TicketConfig {
     /// Issue type name new tickets get.
     pub issue_type: String,
+    /// Issue types the New ticket window offers besides `issue_type`, by name, where the project
+    /// has them.
+    pub issue_types: Vec<String>,
     /// Extra Jira fields sent with every new ticket, as Jira's REST JSON (e.g. a select field the
     /// project requires for a Task).
     pub fields: serde_json::Map<String, serde_json::Value>,
@@ -75,6 +78,7 @@ impl Default for TicketConfig {
     fn default() -> Self {
         Self {
             issue_type: "Task".into(),
+            issue_types: vec!["Task".into(), "Story".into(), "Bug".into(), "Sub-task".into()],
             fields: serde_json::Map::new(),
             language: "Polish".into(),
             opencode_config: dirs::home_dir().map(|h| h.join(".config").join("opencode").join("opencode.json")),

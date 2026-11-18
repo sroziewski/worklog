@@ -19,4 +19,5 @@ pub mod ui_issues;
 pub mod ui_projects;
 pub mod ui_settings;
 pub mod ui_tickets;
+pub mod worklog_comment;
 

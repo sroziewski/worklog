@@ -18,6 +18,7 @@ use crate::ui_projects::ProjectsEditor;
 use crate::ui_settings::{self, WindowSection};
 use crate::ticket_range::MainRow;
 use crate::ui_tickets::{CodeSource, Creator, EVIDENCE_TEXT_SIZE, Outcome, WorkGroup};
+use crate::worklog_comment::{self, Description, Job};
 
 #[derive(Debug, Clone, PartialEq)]
 enum Posted {
@@ -37,11 +38,13 @@ struct RowState {
     posted: Option<Posted>,
     /// Added with "+", not derived from git activity: no evidence, removable.
     manual: bool,
+    /// The worklog comment Accept posts, written by the LLM once the row has a ticket.
+    desc: Description,
 }
 
 impl RowState {
     fn new(id: u64, checked: bool, minutes: u32, manual: bool) -> Self {
-        Self { id, checked, minutes, picked: None, filter: None, posted: None, manual }
+        Self { id, checked, minutes, picked: None, filter: None, posted: None, manual, desc: Description::default() }
     }
 }
 
@@ -181,7 +184,7 @@ pub fn native_options(date: NaiveDate, settings: ui_settings::UiSettings) -> efr
     eframe::NativeOptions {
         viewport: viewport
             .with_title(format!("Worklog — {date}"))
-            .with_inner_size([860.0, 560.0])
+            .with_inner_size([1200.0, 600.0])
             .with_min_inner_size([560.0, 320.0])
             .with_window_level(ui_settings::window_level(settings.always_on_top)),
         // eframe's default wgpu renderer panicked on this machine ("Failed to create staging
@@ -297,16 +300,70 @@ impl WorklogApp {
     }
 
     fn row_inputs(&self) -> Vec<RowInput> {
-        let Some(report) = &self.report else { return Vec::new() };
+        if self.report.is_none() {
+            return Vec::new();
+        }
         (0..self.rows.len())
             .map(|i| RowInput {
                 checked: self.rows[i].checked,
                 minutes: self.rows[i].minutes,
                 target: self.target_key(i),
                 posted_ok: matches!(self.rows[i].posted, Some(Posted::Ok(_))),
-                comment: if self.rows[i].manual { String::new() } else { plan::comment(&report.rows[i].suggestion) },
+                comment: self.rows[i].desc.comment(),
             })
             .collect()
+    }
+
+    /// Per row: it wants a comment written (none started yet for its current ticket).
+    fn wanting(&self) -> Vec<bool> {
+        let Some(report) = &self.report else { return Vec::new() };
+        (0..self.rows.len())
+            .map(|i| {
+                let st = &self.rows[i];
+                let posted = matches!(st.posted, Some(Posted::Ok(_)));
+                st.desc.wants(self.target_key(i).as_deref(), !report.rows[i].suggestion.evidence.is_empty(), posted)
+            })
+            .collect()
+    }
+
+    /// Takes in finished comments and starts the next rows that want one, `MAX_PARALLEL` at a time.
+    fn describe_rows(&mut self) {
+        let Some(report) = &self.report else { return };
+        for (st, row) in self.rows.iter_mut().zip(&report.rows) {
+            st.desc.poll(&plan::comment(&row.suggestion));
+        }
+        let wanting = self.wanting();
+        let running: Vec<bool> = self.rows.iter().map(|r| r.desc.running()).collect();
+        let taken = worklog_comment::slots_taken(&running, &wanting);
+        for i in worklog_comment::to_start(&wanting, &self.postable(), taken) {
+            let Some(key) = self.target_key(i) else { continue };
+            let Some(report) = &self.report else { return };
+            let row = &report.rows[i];
+            let st = &self.rows[i];
+            let summary = worklog_comment::ticket_summary(row.issue.as_ref(), st.picked.map(|c| &report.candidates[c]));
+            let fallback = plan::comment(&row.suggestion);
+            let creds = match crate::llm::credentials(&self.cfg.tickets, |k| std::env::var(k).ok()) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.rows[i].desc.fail(&key, format!("{e:#}"), &fallback);
+                    continue;
+                }
+            };
+            let code = CodeSource { span: crate::git::Span::day(report.date), repo_paths: &report.repo_paths };
+            let lines: Vec<(u64, &[String], &str)> =
+                row.suggestion.evidence.iter().map(|l| (st.id, row.suggestion.repos.as_slice(), l.as_str())).collect();
+            let (sources, span) = crate::ui_tickets::change_lookup(&lines, Some(&code), self.cfg.tickets.send_code);
+            log::info!("asking {} for the worklog comment of {key} from {} items", creds.model, sources.len());
+            let ticket = worklog_comment::Ticket { key: key.clone(), summary };
+            let rx = worklog_comment::spawn(creds, self.cfg.tickets.language.clone(), ticket, sources, span);
+            self.rows[i].desc.start(&key, rx);
+        }
+    }
+
+    /// A ticked row whose comment is being written or waits its turn.
+    fn describing(&self) -> bool {
+        let blocking: Vec<bool> = self.rows.iter().zip(self.wanting()).map(|(r, w)| r.desc.holds_accept(w)).collect();
+        worklog_comment::accept_waits(&self.postable(), &blocking)
     }
 
     /// Minutes of the workday not yet covered by ticked or already-logged rows; what "+" offers.
@@ -520,11 +577,13 @@ impl WorklogApp {
     fn grid_ui(&mut self, ui: &mut egui::Ui, editable: bool, remove: &mut Option<usize>, new_ticket: &mut Option<(String, Option<usize>)>) {
         let busy = self.creator.as_ref().is_some_and(Creator::busy);
         let default_project = self.default_project();
+        let wanting = self.wanting();
         let Some(report) = &self.report else { return };
-        egui::Grid::new("rows").striped(true).num_columns(5).spacing([12.0, 6.0]).show(ui, |ui| {
+        egui::Grid::new("rows").striped(true).num_columns(6).spacing([12.0, 6.0]).show(ui, |ui| {
             ui.strong("");
             ui.strong("Ticket");
             ui.strong("Summary / evidence");
+            ui.strong("Description").on_hover_text("the worklog comment: written by the LLM from the row's changes once it has a ticket; edit it freely");
             ui.strong("Hours");
             ui.strong("");
             ui.end_row();
@@ -609,6 +668,8 @@ impl WorklogApp {
                             }
                         });
                 });
+                let has_ticket = matches!(row.suggestion.bucket, Bucket::Issue(_)) || st.picked.is_some();
+                description_ui(ui, &mut st.desc, editable && !done, has_ticket, !row.suggestion.evidence.is_empty(), wanting[i], i);
                 let mut hours = f64::from(st.minutes) / 60.0;
                 let step = f64::from(self.cfg.round_minutes) / 60.0;
                 let resp = ui.add_enabled(
@@ -644,8 +705,9 @@ fn truncate(s: &str, n: usize) -> String {
 impl eframe::App for WorklogApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
+        self.describe_rows();
         let ctx = ui.ctx().clone();
-        if matches!(self.phase, Phase::Loading(..) | Phase::Posting(..)) {
+        if matches!(self.phase, Phase::Loading(..) | Phase::Posting(..)) || self.rows.iter().any(|r| r.desc.running()) {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
@@ -676,9 +738,16 @@ impl eframe::App for WorklogApp {
                             let label = if failed { "Retry" } else { "Accept" };
                             // A ticket being created may still repick a row; let it land first.
                             let creating = self.creator.as_ref().is_some_and(Creator::creating);
+                            let describing = self.describing();
                             let accept = ui
-                                .add_enabled(selected > 0 && !creating, egui::Button::new(label))
-                                .on_disabled_hover_text(if creating { "wait until the new tickets are created" } else { "nothing ticked to log" });
+                                .add_enabled(selected > 0 && !creating && !describing, egui::Button::new(label))
+                                .on_disabled_hover_text(if creating {
+                                    "wait until the new tickets are created"
+                                } else if describing {
+                                    "wait until the descriptions are written, or type your own"
+                                } else {
+                                    "nothing ticked to log"
+                                });
                             if accept.clicked() {
                                 self.accept();
                             }
@@ -833,6 +902,54 @@ impl WorklogApp {
             }
         }
     }
+}
+
+/// The Description cell: the comment to post, editable, with how its writing goes and ⟳.
+fn description_ui(ui: &mut egui::Ui, desc: &mut Description, editable: bool, has_ticket: bool, has_evidence: bool, queued: bool, i: usize) {
+    ui.vertical(|ui| {
+        ui.set_width(320.0);
+        let hint = match (has_ticket, has_evidence) {
+            _ if desc.edited => "what the time was spent on",
+            (_, false) => "what the time was spent on",
+            (false, true) => "written from the changes once a ticket is picked",
+            (true, true) => "being written from the changes…",
+        };
+        let edit = egui::TextEdit::multiline(&mut desc.text)
+            .id_salt(("desc", i))
+            .desired_rows(3)
+            .desired_width(f32::INFINITY)
+            .font(egui::FontId::proportional(EVIDENCE_TEXT_SIZE))
+            .hint_text(hint);
+        if ui.add_enabled(editable, edit).changed() {
+            desc.edit();
+        }
+        ui.horizontal(|ui| {
+            match &desc.job {
+                Job::Running { step, .. } => {
+                    ui.spinner();
+                    let what = step.map_or_else(|| "reading the changes".to_owned(), |s| format!("{}/3 {}", s.number(), s.label()));
+                    let what = if desc.edited { format!("{what} · your text is kept") } else { what };
+                    ui.weak(what);
+                }
+                Job::Failed(e) => {
+                    ui.colored_label(egui::Color32::from_rgb(190, 130, 20), if desc.edited { "⚠ LLM failed" } else { "⚠ LLM failed: commit list used" })
+                        .on_hover_text(e.as_str());
+                }
+                Job::Idle if queued => {
+                    ui.weak("waits for other rows to be written");
+                }
+                Job::Idle => {}
+            }
+            let can_redo = editable && has_ticket && has_evidence && !desc.blocks_accept();
+            if ui
+                .add_enabled(can_redo, egui::Button::new("⟳").small())
+                .on_hover_text("write the description again from the row's changes (replaces your text)")
+                .clicked()
+            {
+                desc.regenerate();
+            }
+        });
+    });
 }
 
 fn new_ticket_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
